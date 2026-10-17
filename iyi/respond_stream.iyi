@@ -1,0 +1,158 @@
+# respond, the streaming shape: the same responses as respond_dto.iyi,
+# rendered straight into one reused buffer as they are generated, with no
+# response object in between. A port of goose/respond_stream.goose;
+# the RNG is consumed in the same order, so the bytes and the checksum match.
+#
+# This is the "optimise it in iyi" row: no allocation per request at all, so
+# the collector has nothing to do and what is left is the code itself.
+
+module ris/respond_stream
+
+import std/int
+
+N = 1600000_i64 # BENCH_N
+
+def xs_next(x : UInt64) : UInt64
+  v = x
+  v = v ^ (v << 13)
+  v = v ^ (v >> 7)
+  v = v ^ (v << 17)
+  v
+end
+
+def xs_mod(x : UInt64, k : Int64) : Int64
+  (x % k.to_u64).to_i64
+end
+
+# One buffer for the whole run, large enough for any response here (a name
+# of at most 10 bytes doubled by escaping, at most 8 items of under 60 bytes).
+class Buf
+  getter ptr : Pointer(UInt8)
+  property len : Int32
+
+  def initialize
+    @ptr = Pointer(UInt8).malloc(4096_u64)
+    @len = 0
+  end
+
+  def push(b : UInt8) : Nil
+    @ptr[@len] = b
+    @len = @len + 1
+  end
+
+  def append(s : String) : Nil
+    (@ptr + @len.to_i64).copy_from(s.to_unsafe, s.bytesize)
+    @len = @len + s.bytesize
+  end
+end
+
+def emit_int(buf : Buf, v : Int64) : Nil
+  if v == 0_i64
+    buf.push(48_u8)
+    return
+  end
+  start = buf.len
+  d = v
+  while d > 0_i64
+    buf.push((48_i64 + d % 10_i64).to_u8)
+    d = d // 10_i64
+  end
+  # reverse the digits in place
+  a = start
+  b = buf.len - 1
+  p = buf.ptr
+  while a < b
+    t = p[a]
+    p[a] = p[b]
+    p[b] = t
+    a += 1
+    b -= 1
+  end
+end
+
+def emit_name(buf : Buf, seed : UInt64) : Nil
+  r = xs_next(seed)
+  n = 3_i64 + xs_mod(r, 8_i64)
+  odd = xs_mod(r >> 8, 8_i64) == 0_i64
+  buf.push(34_u8)
+  i = 0_i64
+  while i < n
+    r = xs_next(r)
+    if odd && i == 1_i64
+      buf.push(92_u8)
+      buf.push(xs_mod(r, 2_i64) == 0_i64 ? 34_u8 : 92_u8)
+    else
+      buf.push((97_i64 + xs_mod(r, 26_i64)).to_u8)
+    end
+    i += 1_i64
+  end
+  buf.push(34_u8)
+end
+
+def emit_sku(buf : Buf, seed : UInt64) : Nil
+  r = xs_next(seed)
+  buf.push(34_u8)
+  buf.push((65_i64 + xs_mod(r, 26_i64)).to_u8)
+  buf.push((65_i64 + xs_mod(r >> 8, 26_i64)).to_u8)
+  i = 0
+  while i < 4
+    r = xs_next(r)
+    buf.push((48_i64 + xs_mod(r, 10_i64)).to_u8)
+    i += 1
+  end
+  buf.push(34_u8)
+end
+
+def fnv(p : Pointer(UInt8), n : Int32) : UInt64
+  h = 14695981039346656037_u64
+  i = 0
+  while i < n
+    h = (h ^ p[i].to_u64) &* 1099511628211_u64
+    i += 1
+  end
+  h
+end
+
+buf = Buf.new
+seed = 12345_u64
+h = 0_u64
+bytes = 0_i64
+i = 0_i64
+while i < N
+  seed = xs_next(seed)
+  r = xs_next(seed)
+  n = 1_i64 + xs_mod(r, 8_i64)
+  buf.len = 0
+  buf.append("{\"id\":")
+  emit_int(buf, xs_mod(r >> 4, 1000000_i64))
+  buf.append(",\"user\":")
+  emit_name(buf, r >> 8)
+  buf.append(",\"items\":[")
+  total = 0_i64
+  ir = r >> 16
+  k = 0_i64
+  while k < n
+    ir = xs_next(ir)
+    buf.push(44_u8) if k > 0_i64
+    buf.append("{\"sku\":")
+    emit_sku(buf, ir)
+    qty = 1_i64 + xs_mod(ir >> 8, 5_i64)
+    price = 100_i64 + xs_mod(ir >> 16, 99900_i64)
+    buf.append(",\"qty\":")
+    emit_int(buf, qty)
+    buf.append(",\"price\":")
+    emit_int(buf, price)
+    buf.push(125_u8)
+    total += qty * price
+    k += 1_i64
+  end
+  buf.append("],\"total\":")
+  emit_int(buf, total)
+  buf.push(125_u8)
+  h = h ^ (fnv(buf.ptr, buf.len) &* 31_u64 &+ i.to_u64)
+  bytes += buf.len.to_i64
+  i += 1_i64
+end
+puts N
+puts bytes
+puts h

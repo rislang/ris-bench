@@ -1,0 +1,217 @@
+# respond, the DTO shape inside a region: respond_dto.iyi with each request's
+# body wrapped in `IyiRegion.scope` (the ris step 1 prototype, which only the
+# iyi-tape worktree's prelude has). Not a line of the DTO code changes.
+#
+# Below, the original description.
+#
+# respond, the DTO shape: for each request build the typed response object
+# -- an id, a user name, a list of line items -- render it as JSON, and throw
+# both away. A port of goose/respond.goose and
+# rust/respond_dto.rs: same xorshift input, same checksum.
+#
+# This is what an iyi program would write without thinking about memory: a
+# String per name and per sku, an Array of Item structs, a String::Builder for
+# the rendering. Every one of those is a GC allocation, and all of it is
+# garbage before the next request starts.
+
+module ris/respond_region_buf
+
+import std/int
+import std/text
+
+N = 1600000_i64 # BENCH_N
+
+def xs_next(x : UInt64) : UInt64
+  v = x
+  v = v ^ (v << 13)
+  v = v ^ (v >> 7)
+  v = v ^ (v << 17)
+  v
+end
+
+def xs_mod(x : UInt64, k : Int64) : Int64
+  (x % k.to_u64).to_i64
+end
+
+struct Item
+  getter sku : String
+  getter qty : Int64
+  getter price : Int64
+
+  def initialize(@sku : String, @qty : Int64, @price : Int64)
+  end
+end
+
+struct Resp
+  getter id : Int64
+  getter user : String
+  getter items : Array(Item)
+
+  def initialize(@id : Int64, @user : String, @items : Array(Item))
+  end
+end
+
+# A user name of 3..10 letters; one in eight carries a quote or a backslash
+# so the escaping path in the renderer is real.
+def name_of(seed : UInt64) : String
+  r = xs_next(seed)
+  n = 3_i64 + xs_mod(r, 8_i64)
+  odd = xs_mod(r >> 8, 8_i64) == 0_i64
+  String.build do |s|
+    i = 0_i64
+    while i < n
+      r = xs_next(r)
+      if odd && i == 1_i64
+        s.write_byte(xs_mod(r, 2_i64) == 0_i64 ? 34_u8 : 92_u8)
+      else
+        s.write_byte((97_i64 + xs_mod(r, 26_i64)).to_u8)
+      end
+      i += 1_i64
+    end
+  end
+end
+
+# A stock keeping unit: two letters and four digits.
+def sku_of(seed : UInt64) : String
+  r = xs_next(seed)
+  String.build do |s|
+    s.write_byte((65_i64 + xs_mod(r, 26_i64)).to_u8)
+    s.write_byte((65_i64 + xs_mod(r >> 8, 26_i64)).to_u8)
+    i = 0
+    while i < 4
+      r = xs_next(r)
+      s.write_byte((48_i64 + xs_mod(r, 10_i64)).to_u8)
+      i += 1
+    end
+  end
+end
+
+def make_items(seed : UInt64, n : Int64) : Array(Item)
+  t = [] of Item
+  r = seed
+  i = 0_i64
+  while i < n
+    r = xs_next(r)
+    t << Item.new(sku_of(r), 1_i64 + xs_mod(r >> 8, 5_i64), 100_i64 + xs_mod(r >> 16, 99900_i64))
+    i += 1_i64
+  end
+  t
+end
+
+# The renderer of respond_stream.iyi's shape: a plain buffer with no
+# capacity check per byte, reused for every request. The DTO it reads is
+# respond_dto.iyi's, unchanged.
+class Buf
+  getter ptr : Pointer(UInt8)
+  property len : Int32
+
+  def initialize
+    @ptr = Pointer(UInt8).malloc(4096_u64)
+    @len = 0
+  end
+
+  def push(b : UInt8) : Nil
+    @ptr[@len] = b
+    @len = @len + 1
+  end
+
+  def append(s : String) : Nil
+    (@ptr + @len.to_i64).copy_from(s.to_unsafe, s.bytesize)
+    @len = @len + s.bytesize
+  end
+end
+
+def emit_int(buf : Buf, v : Int64) : Nil
+  if v == 0_i64
+    buf.push(48_u8)
+    return
+  end
+  start = buf.len
+  d = v
+  while d > 0_i64
+    buf.push((48_i64 + d % 10_i64).to_u8)
+    d = d // 10_i64
+  end
+  a = start
+  b = buf.len - 1
+  p = buf.ptr
+  while a < b
+    t = p[a]
+    p[a] = p[b]
+    p[b] = t
+    a += 1
+    b -= 1
+  end
+end
+
+def emit_str(buf : Buf, s : String) : Nil
+  buf.push(34_u8)
+  p = s.to_unsafe
+  n = s.bytesize
+  i = 0
+  while i < n
+    c = p[i]
+    buf.push(92_u8) if c == 34_u8 || c == 92_u8
+    buf.push(c)
+    i += 1
+  end
+  buf.push(34_u8)
+end
+
+def render(buf : Buf, r : Resp) : Nil
+  buf.len = 0
+  buf.append("{\"id\":")
+  emit_int(buf, r.id)
+  buf.append(",\"user\":")
+  emit_str(buf, r.user)
+  buf.append(",\"items\":[")
+  total = 0_i64
+  first = true
+  r.items.each do |it|
+    buf.push(44_u8) unless first
+    first = false
+    buf.append("{\"sku\":")
+    emit_str(buf, it.sku)
+    buf.append(",\"qty\":")
+    emit_int(buf, it.qty)
+    buf.append(",\"price\":")
+    emit_int(buf, it.price)
+    buf.push(125_u8)
+    total += it.qty * it.price
+  end
+  buf.append("],\"total\":")
+  emit_int(buf, total)
+  buf.push(125_u8)
+end
+
+def fnv(p : Pointer(UInt8), n : Int32) : UInt64
+  h = 14695981039346656037_u64
+  i = 0
+  while i < n
+    h = (h ^ p[i].to_u64) &* 1099511628211_u64
+    i += 1
+  end
+  h
+end
+
+
+obuf = IyiRegion.outside { Buf.new }
+seed = 12345_u64
+h = 0_u64
+bytes = 0_i64
+i = 0_i64
+while i < N
+  seed = xs_next(seed)
+  IyiRegion.scope do
+    r = xs_next(seed)
+    n = 1_i64 + xs_mod(r, 8_i64)
+    resp = Resp.new(xs_mod(r >> 4, 1000000_i64), name_of(r >> 8), make_items(r >> 16, n))
+    render(obuf, resp)
+    h = h ^ (fnv(obuf.ptr, obuf.len) &* 31_u64 &+ i.to_u64)
+    bytes += obuf.len.to_i64
+  end
+  i += 1_i64
+end
+puts N
+puts bytes
+puts h

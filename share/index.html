@@ -1,0 +1,246 @@
+<title>Rubyist In Stack</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600;9..144,700&family=Source+Sans+3:wght@400;600&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+  /* Layout: one narrow reading column; a headline result, two bar charts, a paste-ready message. */
+  :root {
+    --bg: #fbfaf8;
+    --surface: #ffffff;
+    --ink: #17161a;
+    --ink-2: #55535c;
+    --ink-3: #8a8792;
+    --rule: #e7e4ec;
+    --bar: #2a78d6;
+    --bar-track: #f0eef3;
+    --mark: #6d28d9;
+    --font-display: "Fraunces", Georgia, "Times New Roman", serif;
+    --font-body: "Source Sans 3", system-ui, -apple-system, "Segoe UI", sans-serif;
+    --font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #151418; --surface: #1d1c21; --ink: #f1eff4; --ink-2: #c3c0cb; --ink-3: #8d8a96;
+      --rule: #2e2c34; --bar: #3987e5; --bar-track: #26242c; --mark: #b69cf5; color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #151418; --surface: #1d1c21; --ink: #f1eff4; --ink-2: #c3c0cb; --ink-3: #8d8a96;
+    --rule: #2e2c34; --bar: #3987e5; --bar-track: #26242c; --mark: #b69cf5; color-scheme: dark;
+  }
+  body { background: var(--bg); color: var(--ink); font-family: var(--font-body); font-size: 17px; line-height: 1.55; }
+  .wrap {
+    max-width: 720px; margin: 0 auto;
+    padding-left: max(16px, env(safe-area-inset-left, 0px));
+    padding-right: max(16px, env(safe-area-inset-right, 0px));
+    padding-block: 48px 64px;
+    display: grid; gap: 40px;
+  }
+  header { display: grid; gap: 12px; }
+  .eyebrow { font-family: var(--font-mono); font-size: 13px; letter-spacing: .08em; text-transform: uppercase; color: var(--mark); }
+  h1 { font-family: var(--font-display); font-weight: 700; font-size: clamp(34px, 7vw, 52px); line-height: 1.05; margin: 0; text-wrap: balance; }
+  h1 .acr { color: var(--mark); }
+  .lede { margin: 0; color: var(--ink-2); max-width: 60ch; }
+  h2 { font-family: var(--font-display); font-weight: 600; font-size: 24px; margin: 0; text-wrap: balance; }
+  .sub { margin: 0; color: var(--ink-2); font-size: 15px; max-width: 62ch; }
+  section { display: grid; gap: 16px; }
+
+  .result { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+  .stat { background: var(--surface); border: 1px solid var(--rule); border-radius: 10px; padding: 14px 16px; display: grid; gap: 2px; }
+  .stat .v { font-family: var(--font-display); font-size: 32px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .stat .k { font-size: 14px; color: var(--ink-2); }
+
+  .chart { display: grid; gap: 10px; }
+  .row { display: grid; grid-template-columns: minmax(0, 11.5em) minmax(0, 1fr); gap: 12px; align-items: center; position: relative; outline: none; }
+  .row .name { font-size: 15px; color: var(--ink-2); line-height: 1.25; min-width: 0; }
+  .row .name small { display: block; font-family: var(--font-mono); font-size: 11.5px; color: var(--ink-3); }
+  .row.ours .name { color: var(--ink); font-weight: 600; }
+  .row.ours .name::before { content: "▸ "; color: var(--mark); }
+  .track { position: relative; height: 26px; background: var(--bar-track); border-radius: 0 4px 4px 0; }
+  .fill { position: absolute; inset: 3px auto 3px 0; background: var(--bar); border-radius: 0 4px 4px 0; }
+  .val { position: absolute; top: 50%; transform: translateY(-50%); font-family: var(--font-mono); font-size: 13.5px; font-variant-numeric: tabular-nums; color: var(--ink); white-space: nowrap; padding-left: 8px; }
+  .row.ours .val { font-weight: 600; }
+  .tip {
+    position: absolute; right: 0; bottom: calc(100% + 6px); z-index: 2;
+    background: var(--ink); color: var(--bg); font-size: 13px; line-height: 1.4;
+    padding: 6px 10px; border-radius: 6px; white-space: nowrap; pointer-events: none;
+    opacity: 0; transition: opacity .12s;
+  }
+  .row:hover .tip, .row:focus-visible .tip { opacity: 1; }
+  .row:focus-visible { box-shadow: 0 0 0 2px var(--mark); border-radius: 4px; }
+  .axis { display: grid; grid-template-columns: minmax(0, 11.5em) minmax(0, 1fr); gap: 12px; font-family: var(--font-mono); font-size: 12px; color: var(--ink-3); }
+  .axis div:last-child { display: flex; justify-content: space-between; border-top: 1px solid var(--rule); padding-top: 4px; }
+
+  .note { font-size: 15px; color: var(--ink-2); max-width: 62ch; margin: 0; }
+  details { font-size: 15px; }
+  summary { cursor: pointer; color: var(--ink-2); }
+  .tablewrap { overflow-x: auto; margin-top: 10px; }
+  table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; font-size: 14.5px; }
+  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--rule); }
+  td.n { text-align: right; font-family: var(--font-mono); }
+
+  .paste { background: var(--surface); border: 1px solid var(--rule); border-radius: 10px; padding: 16px; display: grid; gap: 12px; min-width: 0; }
+  .paste pre { margin: 0; font-family: var(--font-mono); font-size: 13.5px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; color: var(--ink); }
+  .copy { justify-self: start; font: 600 14px var(--font-body); color: var(--bg); background: var(--ink); border: 0; border-radius: 6px; padding: 8px 14px; cursor: pointer; }
+  .copy:focus-visible { outline: 2px solid var(--mark); outline-offset: 2px; }
+  footer { font-size: 13.5px; color: var(--ink-3); border-top: 1px solid var(--rule); padding-top: 16px; }
+  footer code { font-family: var(--font-mono); font-size: 12.5px; }
+  @media (prefers-reduced-motion: reduce) { .tip { transition: none; } }
+</style>
+
+<div class="wrap">
+  <header>
+    <div class="eyebrow">ris · mälumudeli katse · 15.10.2026</div>
+    <h1><span class="acr">R</span>ubyist <span class="acr">I</span>n <span class="acr">S</span>tack memory with agents</h1>
+    <p class="lede">Ruby-sarnane iyi kood, mille vastuseobjektid elavad fiber'i pinumälus ilma prügikoristajata. Kompilaator keelab iga koha, kust need võiksid välja lekkida.</p>
+  </header>
+
+  <section aria-label="Peamine tulemus">
+    <div class="result">
+      <div class="stat"><span class="v">0,71 s</span><span class="k">iyi tape-tüüpidega</span></div>
+      <div class="stat"><span class="v">−55%</span><span class="k">aega iyi tavalise GC-ga võrreldes (2,2× kiirem)</span></div>
+      <div class="stat"><span class="v">−30%</span><span class="k">aega sama programmiga C++-is võrreldes (1,42× kiirem)</span></div>
+      <div class="stat"><span class="v">1,7 MB</span><span class="k">mälu, kõige vähem: C++ 4,0 MB, Go 8,6 MB</span></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Sama programm, nii nagu iga keel seda kirjutab</h2>
+    <p class="sub">1,6 miljonit päringut. Iga päring ehitab vastuseobjekti (nimi, 1–8 tellimusrida, igaühel tootekood) ja teeb sellest JSON-i. Kõik keeled toodavad baidi täpsusega sama väljundi ja sama kontrollsumma. Väiksem aeg on parem. Protsent näitab, kui palju rohkem aega kulub kui iyi tape-tüüpidel.</p>
+    <div class="chart" id="chart-dto" role="list"></div>
+  </section>
+
+  <section>
+    <h2>Mälu: sama programm, protsessi tippmälu</h2>
+    <p class="sub">Sama DTO programm, protsessi suurim mälukasutus (peak RSS). Tape kasutab sama mälu iga päringu jaoks uuesti, nii et seda kulub kõige vähem. Protsent näitab, kui palju rohkem mälu kulub kui iyi tape-tüüpidel.</p>
+    <div class="chart" id="chart-mem" role="list"></div>
+  </section>
+
+  <section>
+    <h2>Ilma objektita on kõik keeled võrdsed</h2>
+    <p class="sub">Käsitsi optimeeritud variant kirjutab JSON-i otse ühte puhvrisse ega ehita objekti. Siis on kõik keeled samas kohas. Vahe tekib ainult objekti ehitamisel, ehk seal, kus iga keel mälu eraldab. Protsent näitab, kui palju rohkem aega kulub kui kiireimal.</p>
+    <div class="chart" id="chart-stream" role="list"></div>
+  </section>
+
+  <section>
+    <details>
+      <summary>Kõik numbrid tabelina</summary>
+      <div class="tablewrap">
+        <table>
+          <thead><tr><th>Variant</th><th>Kuidas kirjutatud</th><th style="text-align:right">Aeg</th><th style="text-align:right">aeg vs iyi tape</th><th style="text-align:right">Mälu</th><th style="text-align:right">mälu vs iyi tape</th></tr></thead>
+          <tbody id="table-body"></tbody>
+        </table>
+      </div>
+    </details>
+  </section>
+
+  <section>
+    <h2>Saada sõbrale</h2>
+    <div class="paste">
+      <pre id="paste-text">ris: Rubyist In Stack memory with agents
+
+Tegin iyi-le (Crystali-põhine keel) uue mälumudeli: vastuseobjektid elavad fiber'i pinumälus ilma GC-ta ja kompilaator keelab nende väljalekkimise.
+
+Sama programm (1,6 milj JSON-vastust), iga keel oma tavapärasel viisil:
+
+                    aeg             mälu
+iyi tape-tüüpidega  0,71 s          1,7 MB
+Goose               0,70 s    −1%   2,0 MB   +18%
+C++                 1,01 s   +42%   4,0 MB  +135%
+Rust                1,23 s   +73%   2,3 MB   +35%
+iyi tavalise GC-ga  1,59 s  +124%   7,7 MB  +353%
+Go                  1,72 s  +142%   8,6 MB  +406%
+
+(protsent = kui palju rohkem kui iyi tape-tüüpidel; kõik -O3, mediaan 9 vahelduvast jooksust)
+
+Kõik annavad sama kontrollsumma. Käsitsi optimeerituna on kõik keeled 0,55–0,70 s, nii et vahe tuleb ainult mälueraldustest.</pre>
+      <button class="copy" id="copy-btn" type="button">Kopeeri tekst</button>
+    </div>
+  </section>
+
+  <footer>
+    Üks masin (x86_64 Linux). Aeg on mediaan 9 voorust, kus kõik programmid jooksid igas voorus juhuslikus järjekorras. Kõik kompileeritud samal optimeerimistasemel kui iyi <code>--release</code> (LLVM -O3): g++ 15.2 <code>-O3</code>, rustc 1.99 <code>-C opt-level=3 -C codegen-units=1</code>, Goose <code>-O2</code> → gcc <code>-O3</code>, go 1.26. C++ ja Rusti kood on Goose'i benchmarkist muutmata kujul, Go versioon on kirjutatud sama mustri järgi. iyi tape-versioon eeldefineerib puhvrite mahud; ilma selleta on see 0,74 s. iyi tavalise GC-ga ja Go kasutavad prügikoristuseks lisatuuma, nii et nende CPU aeg on seinakella ajast suurem (iyi GC: 1,6 s seinakell, 3,1 s CPU). See töö sobib tape'ile kõige paremini: palju lühiajalisi väikeseid objekte. Puhta arvutuse puhul eelist pole.
+  </footer>
+</div>
+
+<script>
+  const dto = [
+    { name: "iyi, @[OnTape] tüübid", how: "TapeString, TapeArray", s: 0.71, mb: 1.7, ours: true },
+    { name: "Goose", how: "inline DTO", s: 0.70, mb: 2.0 },
+    { name: "C++", how: "std::string, std::vector", s: 1.01, mb: 4.0 },
+    { name: "Rust", how: "String, Vec", s: 1.23, mb: 2.3 },
+    { name: "iyi, tavaline GC", how: "String, Array", s: 1.59, mb: 7.7 },
+    { name: "Go", how: "string, []Item", s: 1.72, mb: 8.6 },
+  ];
+  const stream = [
+    { name: "Go", how: "üks []byte", s: 0.55, mb: 2.1 },
+    { name: "Goose", how: "otse puhvrisse", s: 0.58, mb: 2.0 },
+    { name: "iyi", how: "üks taaskasutatav puhver", s: 0.59, mb: 1.7, ours: true },
+    { name: "C++", how: "üks std::string", s: 0.69, mb: 4.0 },
+    { name: "Rust", how: "üks String", s: 0.70, mb: 2.3 },
+  ];
+  const MAX = 1.8; // one scale for both charts, so their bars compare directly
+  const fmt = (n, d = 2) => n.toFixed(d).replace(".", ",");
+  // Extra time against a base, in whole percent: 1.08 s against 0.69 s is +57%.
+  const pctOver = (s, base) => {
+    const p = Math.round((s / base - 1) * 100);
+    return (p >= 0 ? "+" : "−") + Math.abs(p) + "%";
+  };
+  const TAPE = 0.71;
+  const TAPE_MB = 1.7;
+
+  // One chart of one measure. `base` is what the percentages count from:
+  // iyi tape for the DTO charts, the fastest row for the hand-optimised one.
+  const TIME = { key: "s", max: MAX, unit: "s", digits: 2, word: "aega", ticks: ["0 s", "0,6", "1,2", "1,8 s"] };
+  const MEM = { key: "mb", max: 9, unit: "MB", digits: 1, word: "mälu", ticks: ["0 MB", "3", "6", "9 MB"] };
+
+  function draw(id, rows, m, base, baseName) {
+    const el = document.getElementById(id);
+    rows.forEach(r => {
+      const v = r[m.key];
+      const row = document.createElement("div");
+      row.className = "row" + (r.ours ? " ours" : "");
+      row.setAttribute("role", "listitem");
+      row.tabIndex = 0;
+      const pct = (v / m.max) * 100;
+      const isBase = v === base;
+      const tag = isBase ? "" : `  ${pctOver(v, base)}`;
+      const rel = isBase ? baseName : `${pctOver(v, base)} ${m.word} (${fmt(v / base)}×)`;
+      row.innerHTML =
+        `<div class="name">${r.name}<small>${r.how}</small></div>` +
+        `<div class="track"><div class="fill" style="width:${pct}%"></div>` +
+        `<span class="val" style="left:${pct}%">${fmt(v, m.digits)} ${m.unit}${tag}</span></div>` +
+        `<div class="tip">${r.name}: ${fmt(r.s)} s · ${fmt(r.mb, 1)} MB · ${rel}</div>`;
+      row.setAttribute("aria-label", `${r.name}, ${r.how}: ${fmt(r.s)} sekundit, ${fmt(r.mb, 1)} MB`);
+      el.appendChild(row);
+    });
+    const axis = document.createElement("div");
+    axis.className = "axis";
+    axis.setAttribute("aria-hidden", "true");
+    axis.innerHTML = `<div></div><div>${m.ticks.map(t => `<span>${t}</span>`).join("")}</div>`;
+    el.appendChild(axis);
+  }
+  draw("chart-dto", dto, TIME, TAPE, "võrdluse alus");
+  draw("chart-mem", [...dto].sort((a, b) => a.mb - b.mb), MEM, TAPE_MB, "võrdluse alus");
+  draw("chart-stream", stream, TIME, Math.min(...stream.map(r => r.s)), "kiireim");
+
+  const tbody = document.getElementById("table-body");
+  [...dto.map(r => ({ ...r, kind: "DTO" })), ...stream.map(r => ({ ...r, kind: "käsitsi" }))].forEach(r => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>${r.name} (${r.kind})</td><td>${r.how}</td><td class="n">${fmt(r.s)} s</td><td class="n">${pctOver(r.s, TAPE)}</td><td class="n">${fmt(r.mb, 1)} MB</td><td class="n">${pctOver(r.mb, TAPE_MB)}</td>`;
+    tbody.appendChild(tr);
+  });
+
+  const btn = document.getElementById("copy-btn");
+  btn.addEventListener("click", () => {
+    const text = document.getElementById("paste-text").textContent;
+    const done = () => { btn.textContent = "Kopeeritud"; setTimeout(() => (btn.textContent = "Kopeeri tekst"), 1600); };
+    const fallback = () => {
+      const range = document.createRange();
+      range.selectNodeContents(document.getElementById("paste-text"));
+      const sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(range);
+      btn.textContent = "Vali tekst ja kopeeri";
+    };
+    try { navigator.clipboard.writeText(text).then(done, fallback); } catch (e) { fallback(); }
+  });
+</script>
