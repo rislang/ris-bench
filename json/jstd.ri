@@ -2,7 +2,7 @@ module jstd
 
 import std/int
 import std/time::{Time}
-import std/json::{JSON, Any, Document, TapeBuilder}
+import std/json::{JSON, Any, Document, TapeWriter}
 import std/gc::{GC}
 
 # std/json on the heap and on the tape (ris 851a3fdd3 or newer):
@@ -177,7 +177,7 @@ end
 def write_tape(rec : Record) : Int64
   total = 0_i64
   Tape.scope do
-    w = Tape::String::Builder.new(256)
+    w = Tape::String::Writer.new(256)
     JSON.build(w) do |b|
       b.object do
         b.field "id", rec.id
