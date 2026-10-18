@@ -75,17 +75,18 @@ end
 @[OnTape]
 struct Parser
   @bytes : Pointer(UInt8)
+  @input : Tape::String
   @size : Int32
   @pos : Int32
   @stack : NodeStack
 
-  def initialize(@bytes : Pointer(UInt8), @size : Int32)
+  def initialize(@bytes : Pointer(UInt8), @size : Int32, @input : Tape::String)
     @pos = 0
     @stack = NodeStack.new(64)
   end
 
   def empty_str : Tape::String
-    Tape::String.new(@bytes, 0)
+    @input[0, 0]
   end
 
   def skip_ws : Nil
@@ -104,7 +105,7 @@ struct Parser
     while @bytes[@pos] != 34_u8
       @pos += 1
     end
-    text = Tape::String.new(@bytes + start, @pos - start)
+    text = @input[start, @pos - start]
     @pos += 1
     text
   end
@@ -241,17 +242,18 @@ end
 @[OnTape]
 struct PoolParser
   @bytes : Pointer(UInt8)
+  @input : Tape::String
   @size : Int32
   @pos : Int32
   getter pool : Pool
 
-  def initialize(@bytes : Pointer(UInt8), @size : Int32)
+  def initialize(@bytes : Pointer(UInt8), @size : Int32, @input : Tape::String)
     @pos = 0
     @pool = Pool.new(1024)
   end
 
   def empty_str : Tape::String
-    Tape::String.new(@bytes, 0)
+    @input[0, 0]
   end
 
   def skip_ws : Nil
@@ -266,7 +268,7 @@ struct PoolParser
     while @bytes[@pos] != 34_u8
       @pos += 1
     end
-    text = Tape::String.new(@bytes + start, @pos - start)
+    text = @input[start, @pos - start]
     @pos += 1
     text
   end
@@ -343,17 +345,18 @@ end
 @[OnTape]
 struct StreamParser
   @bytes : Pointer(UInt8)
+  @input : Tape::String
   @size : Int32
   @pos : Int32
   getter pool : Pool
 
-  def initialize(@bytes : Pointer(UInt8), @size : Int32)
+  def initialize(@bytes : Pointer(UInt8), @size : Int32, @input : Tape::String)
     @pos = 0
     @pool = Pool.new(1024)
   end
 
   def empty_str : Tape::String
-    Tape::String.new(@bytes, 0)
+    @input[0, 0]
   end
 
   def skip_ws : Nil
@@ -368,7 +371,7 @@ struct StreamParser
     while @bytes[@pos] != 34_u8
       @pos += 1
     end
-    text = Tape::String.new(@bytes + start, @pos - start)
+    text = @input[start, @pos - start]
     @pos += 1
     text
   end
@@ -444,17 +447,18 @@ end
 @[OnTape]
 struct TStreamParser
   @bytes : Pointer(UInt8)
+  @input : Tape::String
   @size : Int32
   @pos : Int32
   getter tree : Tape::Tree(SNode)
 
-  def initialize(@bytes : Pointer(UInt8), @size : Int32)
+  def initialize(@bytes : Pointer(UInt8), @size : Int32, @input : Tape::String)
     @pos = 0
     @tree = Tape::Tree(SNode).new(1024)
   end
 
   def empty_str : Tape::String
-    Tape::String.new(@bytes, 0)
+    @input[0, 0]
   end
 
   def skip_ws : Nil
@@ -469,7 +473,7 @@ struct TStreamParser
     while @bytes[@pos] != 34_u8
       @pos += 1
     end
-    text = Tape::String.new(@bytes + start, @pos - start)
+    text = @input[start, @pos - start]
     @pos += 1
     text
   end
@@ -640,12 +644,12 @@ if Program.args.size > 3 && Program.args[3] == "bytes"
     total = walk_any(JSON.parse(text), 0_i64)
   elsif mode != "pool"
     Tape.scope do
-      parser = Parser.new(text.to_unsafe, text.bytesize)
+      parser = Parser.new(text.to_unsafe, text.bytesize, Tape::String.view(text))
       total = walk(parser.parse_value)
     end
   else
     Tape.scope do
-      pp = PoolParser.new(text.to_unsafe, text.bytesize)
+      pp = PoolParser.new(text.to_unsafe, text.bytesize, Tape::String.view(text))
       root = pp.parse_value(pp.empty_str)
       total = walk_pool(pp.pool, root)
       pool_bytes = pp.pool.size.to_i64 &* sizeof(PNode).to_i64
@@ -662,19 +666,19 @@ rounds.times do
   end
   Tape.scope do
     if mode == "tstream"
-      tp = TStreamParser.new(text.to_unsafe, text.bytesize)
+      tp = TStreamParser.new(text.to_unsafe, text.bytesize, Tape::String.view(text))
       tp.parse_value(tp.empty_str)
       total = total &+ walk_tstream(tp.tree, 0)
     elsif mode == "stream"
-      sp = StreamParser.new(text.to_unsafe, text.bytesize)
+      sp = StreamParser.new(text.to_unsafe, text.bytesize, Tape::String.view(text))
       sp.parse_value(sp.empty_str)
       total = total &+ walk_stream(sp.pool, 0)
     elsif mode == "pool"
-      pp = PoolParser.new(text.to_unsafe, text.bytesize)
+      pp = PoolParser.new(text.to_unsafe, text.bytesize, Tape::String.view(text))
       root = pp.parse_value(pp.empty_str)
       total = total &+ walk_pool(pp.pool, root)
     else
-      parser = Parser.new(text.to_unsafe, text.bytesize)
+      parser = Parser.new(text.to_unsafe, text.bytesize, Tape::String.view(text))
       total = total &+ walk(parser.parse_value)
     end
   end

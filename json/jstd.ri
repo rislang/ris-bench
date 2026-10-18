@@ -150,7 +150,7 @@ def parse_small(mode : String, texts : Array(String)) : Int64
   else
     texts.each do |t|
       Tape.scope do
-        doc = JSON.parse(Tape::String.new(t.to_unsafe, t.bytesize))
+        doc = JSON.parse(Tape::String.view(t))
         total = total &+ walk_doc(doc, doc.root, 0_i64)
       end
     end
@@ -163,12 +163,12 @@ def parse_once(mode : String, text : String) : Int64
   return JSON.parse(text).size.to_i64 if mode == "parse-heap-only"
   if mode == "parse-tape-only"
     n = 0_i64
-    Tape.scope { n = JSON.parse(Tape::String.new(text.to_unsafe, text.bytesize)).tree.size.to_i64 }
+    Tape.scope { n = JSON.parse(Tape::String.view(text)).tree.size.to_i64 }
     return n
   end
   total = 0_i64
   Tape.scope do
-    doc = JSON.parse(Tape::String.new(text.to_unsafe, text.bytesize))
+    doc = JSON.parse(Tape::String.view(text))
     total = walk_doc(doc, doc.root, 0_i64)
   end
   total
@@ -194,7 +194,7 @@ def write_tape(rec : Record) : Int64
       end
     end
     text = w.finish
-    total = text.bytesize.to_i64 &+ text.to_unsafe[text.bytesize - 2].to_i64
+    total = text.bytesize.to_i64 &+ text[-2].to_i64
   end
   total
 end
