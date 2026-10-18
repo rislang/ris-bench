@@ -41,7 +41,7 @@ C++ and Rust; `GC.stats` in ris, iyi and Crystal; `runtime.MemStats` in Go.
 | `go/` | Go: `respond_dto/`, `respond_stream/` |
 | `crystal/` | Crystal: `respond_dto.cr`, the iyi DTO without its imports |
 | `ruby/` | Ruby: `respond_dto.rb`, also compiles with Spinel |
-| `json/` | `jnest.ri`: a JSON tree in six layouts, tape and heap |
+| `json/` | `jnest.ri`: a JSON tree in six layouts; `jstd.ri`: std/json, heap and tape |
 | `tools/` | `count_malloc.c`: malloc bytes and calls, as LD_PRELOAD |
 | `share/` | `index.html`: an earlier results page |
 

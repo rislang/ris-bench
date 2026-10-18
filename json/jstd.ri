@@ -1,0 +1,230 @@
+module jstd
+
+import std/int
+import std/time::{Time}
+import std/json::{JSON, Any, TapeDocument, TapeBuilder}
+import std/gc::{GC}
+
+# std/json on the heap and on the tape (ris 851a3fdd3 or newer):
+#   ris build --release json/jstd.ri -o jstd && ./jstd MODE [bytes]
+#   parse-heap / parse-tape: a 4.6 MB document parsed and walked, 20 times
+#   write-heap / write-tape: 20000 records each written as a document, 20 times
+#   small-heap / small-tape: 20000 documents of ~230 bytes parsed, 20 times
+#   parse-heap-only / parse-tape-only: the 4.6 MB parse without the walk
+# "bytes" runs one round with collection off and prints heap bytes.
+
+def xs_next(x : UInt64) : UInt64
+  v = x
+  v = v ^ (v << 13)
+  v = v ^ (v >> 7)
+  v = v ^ (v << 17)
+  v
+end
+
+def document(records : Int32) : String
+  x = 88172645463325252_u64
+  String.build do |io|
+    io << "[\n"
+    records.times do |r|
+      io << ",\n" if r > 0
+      io << "{\"id\":" << r << ",\"name\":\"user" << r << "\\n\",\"tags\":["
+      x = xs_next(x)
+      (x % 12_u64).to_i32.times do |t|
+        io << "," if t > 0
+        io << "\"tag" << t << "\""
+      end
+      io << "],\"score\":" << r << ".25,\"rows\":["
+      x = xs_next(x)
+      rows = (x % 5_u64).to_i32 + 1
+      rows.times do |i|
+        io << "," if i > 0
+        io << "["
+        x = xs_next(x)
+        ((x % 8_u64).to_i32 + 1).times do |j|
+          io << "," if j > 0
+          io << (r &* 7 &+ i &* 3 &+ j)
+        end
+        io << "]"
+      end
+      io << "],\"meta\":{\"active\":" << (r % 2 == 0 ? "true" : "false")
+      io << ",\"parent\":null,\"scores\":[" << r % 97 << "," << r % 13 << "]}}"
+    end
+    io << "\n]\n"
+  end
+end
+
+def walk_any(node : Any, key : Int64) : Int64
+  raw = node.raw
+  sum = key
+  case raw
+  when Nil
+    sum = sum &+ 0
+  when Bool
+    sum = sum &+ (raw ? 3 : 1)
+  when Int64
+    sum = sum &+ raw &+ 3
+  when Float64
+    sum = sum &+ (raw * 4.0).to_i64 &+ 7
+  when String
+    sum = sum &+ raw.bytesize.to_i64 &+ 4
+  when Array(Any)
+    sum = sum &+ 5
+    raw.each { |child| sum = sum &+ walk_any(child, 0_i64) &* 3 }
+  when Hash(String, Any)
+    sum = sum &+ 6
+    raw.each { |k, child| sum = sum &+ walk_any(child, k.bytesize.to_i64) &* 3 }
+  end
+  sum
+end
+
+class Record
+  getter id : Int64
+  getter name : String
+  getter tags : Array(String)
+  getter score : Float64
+  getter active : Bool
+  getter rows : Array(Int64)
+
+  def initialize(@id, @name, @tags, @score, @active, @rows)
+  end
+end
+
+def records(count : Int32) : Array(Record)
+  x = 88172645463325252_u64
+  Array(Record).new(count) do |r|
+    x = xs_next(x)
+    tags = Array(String).new((x % 6_u64).to_i32) { |t| "tag#{t}" }
+    x = xs_next(x)
+    rows = Array(Int64).new((x % 8_u64).to_i32 + 1) { |j| (r &* 7 &+ j).to_i64 }
+    Record.new(r.to_i64, "user \"#{r}\"", tags, r.to_f64 + 0.5, r % 2 == 0, rows)
+  end
+end
+
+def write_heap(rec : Record) : Int64
+  text = JSON.build do |b|
+    b.object do
+      b.field "id", rec.id
+      b.field "name", rec.name
+      b.field "tags" do
+        b.array { rec.tags.each { |t| b.string t } }
+      end
+      b.field "score", rec.score
+      b.field "active", rec.active
+      b.field "rows" do
+        b.array { rec.rows.each { |v| b.number v } }
+      end
+      b.field "parent", nil
+    end
+  end
+  text.bytesize.to_i64 &+ text.to_unsafe[text.bytesize - 2].to_i64
+end
+
+def walk_doc(doc : TapeDocument, index : Int32, key : Int64) : Int64
+  sum = key
+  kind = doc.kind(index)
+  case kind
+  when TapeDocument::Kind::Null
+    sum = sum &+ 0
+  when TapeDocument::Kind::Bool
+    sum = sum &+ (doc.bool(index) ? 3 : 1)
+  when TapeDocument::Kind::Int
+    sum = sum &+ doc.int(index) &+ 3
+  when TapeDocument::Kind::Float
+    sum = sum &+ (doc.float(index) * 4.0).to_i64 &+ 7
+  when TapeDocument::Kind::String
+    sum = sum &+ doc.string(index).bytesize.to_i64 &+ 4
+  when TapeDocument::Kind::Array
+    sum = sum &+ 5
+    doc.each(index) { |child| sum = sum &+ walk_doc(doc, child, 0_i64) &* 3 }
+  else
+    sum = sum &+ 6
+    doc.each(index) { |child| sum = sum &+ walk_doc(doc, child, doc.key(child).bytesize.to_i64) &* 3 }
+  end
+  sum
+end
+
+def parse_small(mode : String, texts : Array(String)) : Int64
+  total = 0_i64
+  if mode == "small-heap"
+    texts.each { |t| total = total &+ walk_any(JSON.parse(t), 0_i64) }
+  else
+    texts.each do |t|
+      Tape.scope do
+        doc = JSON.parse(TapeString.new(t.to_unsafe, t.bytesize))
+        total = total &+ walk_doc(doc, doc.root, 0_i64)
+      end
+    end
+  end
+  total
+end
+
+def parse_once(mode : String, text : String) : Int64
+  return walk_any(JSON.parse(text), 0_i64) if mode == "parse-heap"
+  return JSON.parse(text).size.to_i64 if mode == "parse-heap-only"
+  if mode == "parse-tape-only"
+    n = 0_i64
+    Tape.scope { n = JSON.parse(TapeString.new(text.to_unsafe, text.bytesize)).tree.size.to_i64 }
+    return n
+  end
+  total = 0_i64
+  Tape.scope do
+    doc = JSON.parse(TapeString.new(text.to_unsafe, text.bytesize))
+    total = walk_doc(doc, doc.root, 0_i64)
+  end
+  total
+end
+
+def write_tape(rec : Record) : Int64
+  total = 0_i64
+  Tape.scope do
+    w = TapeWriter.new(256)
+    JSON.build(w) do |b|
+      b.object do
+        b.field "id", rec.id
+        b.field "name", rec.name
+        b.field "tags" do
+          b.array { rec.tags.each { |t| b.string t } }
+        end
+        b.field "score", rec.score
+        b.field "active", rec.active
+        b.field "rows" do
+          b.array { rec.rows.each { |v| b.number v } }
+        end
+        b.field "parent", nil
+      end
+    end
+    text = w.finish
+    total = text.bytesize.to_i64 &+ text.to_unsafe[text.bytesize - 2].to_i64
+  end
+  total
+end
+
+def write_once(mode : String, recs : Array(Record)) : Int64
+  total = 0_i64
+  if mode == "write-heap"
+    recs.each { |rec| total = total &+ write_heap(rec) }
+  else
+    recs.each { |rec| total = total &+ write_tape(rec) }
+  end
+  total
+end
+
+mode = Program.args.size > 0 ? Program.args[0] : "parse-heap"
+bytes = Program.args.size > 1 && Program.args[1] == "bytes"
+parse = mode.starts_with?("parse")
+small = mode.starts_with?("small")
+text = parse ? document(20000) : ""
+texts = small ? Array(String).new(20000) { |r| document(1) + (" " * (r % 3)) } : [] of String
+recs = parse || small ? [] of Record : records(20000)
+rounds = bytes ? 1 : 20
+total = 0_i64
+GC.disable if bytes
+gc_before = GC.stats.collections
+before = IyiMark.allocated_since
+start = Time.monotonic
+rounds.times do
+  total = total &+ (small ? parse_small(mode, texts) : parse ? parse_once(mode, text) : write_once(mode, recs))
+end
+elapsed = Time.monotonic - start
+heap = bytes ? IyiMark.allocated_since - before : 0_u64
+puts "#{mode}: checksum #{total}, #{elapsed.total_milliseconds.round(1)} ms, heap #{heap / rounds} B/round, collections #{GC.stats.collections - gc_before}"
