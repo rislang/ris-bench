@@ -1,11 +1,11 @@
 # respond, step B: the DTO as tape types. The same responses, bytes and
 # checksum as respond_dto.iyi, built with the ris/iyi-tape compiler, whose
-# prelude has `Tape.scope`, `Tape::String` and `Tape::Array` and whose compiler
+# prelude has `Tape.run`, `Tape::String` and `Tape::Array` and whose compiler
 # refuses a tape value anywhere it could outlive its scope.
 #
 # Against respond_dto.iyi the program changes in three ways and no others:
 # the two structs are marked `@[OnTape]`, their `String`/`Array` fields are
-# `Tape::String`/`Tape::Array`, and each request runs inside `Tape.scope`. Every
+# `Tape::String`/`Tape::Array`, and each request runs inside `Tape.run`. Every
 # other allocation goes to the collected heap as before.
 
 module ris/respond_tape
@@ -152,7 +152,7 @@ bytes = 0_i64
 i = 0_i64
 while i < N
   seed = xs_next(seed)
-  Tape.scope do
+  Tape.run do
     r = xs_next(seed)
     n = 1_i64 + xs_mod(r, 8_i64)
     resp = Resp.new(xs_mod(r >> 4, 1000000_i64), name_of(r >> 8), make_items(r >> 16, n))

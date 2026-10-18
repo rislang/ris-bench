@@ -643,12 +643,12 @@ if Program.args.size > 3 && Program.args[3] == "bytes"
   if mode == "heap"
     total = walk_any(JSON.parse(text), 0_i64)
   elsif mode != "pool"
-    Tape.scope do
+    Tape.run do
       parser = Parser.new(text.to_unsafe, text.bytesize, Tape::String.view(text))
       total = walk(parser.parse_value)
     end
   else
-    Tape.scope do
+    Tape.run do
       pp = PoolParser.new(text.to_unsafe, text.bytesize, Tape::String.view(text))
       root = pp.parse_value(pp.empty_str)
       total = walk_pool(pp.pool, root)
@@ -664,7 +664,7 @@ rounds.times do
     total = total &+ walk_any(JSON.parse(text), 0_i64)
     next
   end
-  Tape.scope do
+  Tape.run do
     if mode == "tstream"
       tp = TStreamParser.new(text.to_unsafe, text.bytesize, Tape::String.view(text))
       tp.parse_value(tp.empty_str)
