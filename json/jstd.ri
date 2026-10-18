@@ -2,7 +2,7 @@ module jstd
 
 import std/int
 import std/time::{Time}
-import std/json::{JSON, Any, TapeDocument, TapeBuilder}
+import std/json::{JSON, Any, Document, TapeBuilder}
 import std/gc::{GC}
 
 # std/json on the heap and on the tape (ris 851a3fdd3 or newer):
@@ -119,21 +119,21 @@ def write_heap(rec : Record) : Int64
   text.bytesize.to_i64 &+ text.to_unsafe[text.bytesize - 2].to_i64
 end
 
-def walk_doc(doc : TapeDocument, index : Int32, key : Int64) : Int64
+def walk_doc(doc : Document, index : Int32, key : Int64) : Int64
   sum = key
   kind = doc.kind(index)
   case kind
-  when TapeDocument::Kind::Null
+  when Document::Kind::Null
     sum = sum &+ 0
-  when TapeDocument::Kind::Bool
+  when Document::Kind::Bool
     sum = sum &+ (doc.bool(index) ? 3 : 1)
-  when TapeDocument::Kind::Int
+  when Document::Kind::Int
     sum = sum &+ doc.int(index) &+ 3
-  when TapeDocument::Kind::Float
+  when Document::Kind::Float
     sum = sum &+ (doc.float(index) * 4.0).to_i64 &+ 7
-  when TapeDocument::Kind::String
+  when Document::Kind::String
     sum = sum &+ doc.string(index).bytesize.to_i64 &+ 4
-  when TapeDocument::Kind::Array
+  when Document::Kind::Array
     sum = sum &+ 5
     doc.each(index) { |child| sum = sum &+ walk_doc(doc, child, 0_i64) &* 3 }
   else
@@ -150,7 +150,7 @@ def parse_small(mode : String, texts : Array(String)) : Int64
   else
     texts.each do |t|
       Tape.scope do
-        doc = JSON.parse(TapeString.new(t.to_unsafe, t.bytesize))
+        doc = JSON.parse(Tape::String.new(t.to_unsafe, t.bytesize))
         total = total &+ walk_doc(doc, doc.root, 0_i64)
       end
     end
@@ -163,12 +163,12 @@ def parse_once(mode : String, text : String) : Int64
   return JSON.parse(text).size.to_i64 if mode == "parse-heap-only"
   if mode == "parse-tape-only"
     n = 0_i64
-    Tape.scope { n = JSON.parse(TapeString.new(text.to_unsafe, text.bytesize)).tree.size.to_i64 }
+    Tape.scope { n = JSON.parse(Tape::String.new(text.to_unsafe, text.bytesize)).tree.size.to_i64 }
     return n
   end
   total = 0_i64
   Tape.scope do
-    doc = JSON.parse(TapeString.new(text.to_unsafe, text.bytesize))
+    doc = JSON.parse(Tape::String.new(text.to_unsafe, text.bytesize))
     total = walk_doc(doc, doc.root, 0_i64)
   end
   total
@@ -177,7 +177,7 @@ end
 def write_tape(rec : Record) : Int64
   total = 0_i64
   Tape.scope do
-    w = TapeWriter.new(256)
+    w = Tape::String::Builder.new(256)
     JSON.build(w) do |b|
       b.object do
         b.field "id", rec.id
