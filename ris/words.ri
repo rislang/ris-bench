@@ -1,0 +1,164 @@
+# words: Goose's bench/goose/words.goose in ris. A text of two million words
+# drawn from a skewed vocabulary, split into words and counted in an
+# open-addressed map. Prints 2000000, 146190 and 236020268, as Goose does.
+#
+#   ./words        # GC heap: the text a String, each word and key a copy
+#   ./words tape   # the text, the words and the map on the tape; every key
+#                  # a view into the text, as Goose's slices are
+#
+# The counts do not depend on the hash, so each version uses its own.
+
+module words
+
+import std/int
+
+N = 2000000
+MAXW = 20
+
+def xs_next(x : UInt64) : UInt64
+  v = x
+  v = v ^ (v << 13)
+  v = v ^ (v >> 7)
+  v = v ^ (v << 17)
+  v
+end
+
+def xs_mod(x : UInt64, k : Int64) : Int64
+  (x % k.to_u64).to_i64
+end
+
+def next_pow2(x : Int32) : Int32
+  p = 1
+  while p < x
+    p = p * 2
+  end
+  p
+end
+
+# The vocabulary, on the heap in both versions: Goose's fixed-capacity words.
+def vocabulary(vocab : Int32) : Array(String)
+  r = 12345_u64
+  dict = [] of String
+  vocab.times do
+    n = 3 + xs_mod(r = xs_next(r), 12_i64)
+    dict << String.build(MAXW) do |w|
+      n.times { w << ('a'.ord + xs_mod(r = xs_next(r), 26_i64)).chr }
+    end
+  end
+  dict
+end
+
+# The text's draws continue the vocabulary's random stream.
+def draw_state(vocab : Int32) : UInt64
+  r = 12345_u64
+  vocab.times do
+    n = 3 + xs_mod(r = xs_next(r), 12_i64)
+    n.times { r = xs_next(r) }
+  end
+  r
+end
+
+def fnv(h : UInt64, b : UInt8) : UInt64
+  (h ^ b.to_u64) &* 1099511628211_u64
+end
+
+def heap : {Int32, Int32, Int64}
+  vocab = N // 10 + 16
+  dict = vocabulary(vocab)
+  r = draw_state(vocab)
+  text = String.build(N * 9) do |t|
+    N.times do
+      r = xs_next(r)
+      a = xs_mod(r, vocab.to_i64)
+      t << dict[(a * a // vocab).to_i32] << ' '
+    end
+  end
+  words = text.split(' ').reject(&.empty?)
+  counts = {} of String => Int32
+  words.each { |w| counts[w] = (counts[w]? || 0) + 1 }
+  total = 0_i64
+  counts.each { |key, count| total += count.to_i64 * (key.bytesize + key.to_unsafe[0]).to_i64 }
+  {words.size, counts.size, total}
+end
+
+@[OnTape]
+struct Slot
+  getter key : Tape::String
+  getter count : Int32
+
+  def initialize(@key : Tape::String, @count : Int32)
+  end
+end
+
+def on_tape : {Int32, Int32, Int64}
+  vocab = N // 10 + 16
+  dict = vocabulary(vocab)
+  r = draw_state(vocab)
+  answer = {0, 0, 0_i64}
+  tape do
+    w = Tape::String::Writer.new(N * 9)
+    N.times do
+      r = xs_next(r)
+      a = xs_mod(r, vocab.to_i64)
+      w.append(dict[(a * a // vocab).to_i32])
+      w.push(32_u8)
+    end
+    text = w.finish
+    # Split: each word a view into the text, counted first so the list is
+    # made at its size and nothing else grows beside it.
+    count = 0
+    text.each_byte { |b| count += 1 if b == 32_u8 }
+    words = Tape::Array(Tape::String).new(count) { text[0, 0] }
+    n = 0
+    from = 0
+    i = 0
+    size = text.bytesize
+    while i < size
+      if text[i] == 32_u8
+        if i > from
+          words[n] = text[from, i - from]
+          n += 1
+        end
+        from = i + 1
+      end
+      i += 1
+    end
+    nslots = next_pow2(vocab * 4)
+    mask = (nslots - 1).to_u64
+    empty = text[0, 0]
+    slots = Tape::Array(Slot).new(nslots) { Slot.new(empty, 0) }
+    distinct = 0
+    k = 0
+    while k < n
+      key = words[k]
+      h = 14695981039346656037_u64
+      key.each_byte { |b| h = fnv(h, b) }
+      idx = (h & mask).to_i32
+      loop do
+        slot = slots[idx]
+        if slot.count == 0
+          slots[idx] = Slot.new(key, 1)
+          distinct += 1
+          break
+        end
+        if slot.key == key
+          slots[idx] = Slot.new(key, slot.count + 1)
+          break
+        end
+        idx = ((idx + 1).to_u64 & mask).to_i32
+      end
+      k += 1
+    end
+    total = 0_i64
+    slots.each do |s|
+      total += s.count.to_i64 * (s.key.bytesize + s.key[0]).to_i64 if s.count > 0
+    end
+    answer = {n, distinct, total}
+  end
+  answer
+end
+
+got = Program.args.size > 0 && Program.args[0] == "tape" ? on_tape : heap
+puts got[0]
+puts got[1]
+puts got[2]

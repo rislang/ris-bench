@@ -1,0 +1,156 @@
+# graph_csr: Goose's bench/goose/graph_csr.goose in ris. A random graph of
+# a million vertices and eight million edges, laid out as CSR in two passes
+# over the edges, then a BFS from four sources. Prints 9000000 and
+# 27635866, as Goose does.
+#
+#   ./graph_csr        # every array on the GC heap
+#   ./graph_csr tape   # every array on the tape, sized before it is filled
+#
+# Goose keeps its seven arrays on seven data stacks, each growing at the
+# top of its own. A ris tape has one end, so on it each array is made at
+# its final size and written in place; only the heap version grows them.
+
+module graph_csr
+
+import std/int
+import std/indexable
+
+V = 1000000
+DEG = 8
+SOURCES = 4
+
+def xs_next(x : UInt64) : UInt64
+  v = x
+  v = v ^ (v << 13)
+  v = v ^ (v >> 7)
+  v = v ^ (v << 17)
+  v
+end
+
+def xs_mod(x : UInt64, k : Int64) : Int64
+  (x % k.to_u64).to_i64
+end
+
+def heap : Int64
+  ne = V * DEG
+  esrc = [] of Int32
+  edst = [] of Int32
+  start = [] of Int32
+  (V + 1).times { start << 0 }
+  r = 12345_u64
+  ne.times do
+    r = xs_next(r)
+    u = xs_mod(r, V.to_i64).to_i32
+    esrc << u
+    edst << xs_mod(r >> 24, V.to_i64).to_i32
+    start[u + 1] = start[u + 1] + 1
+  end
+  V.times { |v| start[v + 1] = start[v + 1] + start[v] }
+  cursor = [] of Int32
+  (V + 1).times { |v| cursor << start[v] }
+  out = [] of Int32
+  ne.times { out << 0 }
+  e = 0
+  while e < ne
+    s = esrc[e]
+    out[cursor[s]] = edst[e]
+    cursor[s] = cursor[s] + 1
+    e += 1
+  end
+  dist = [] of Int32
+  V.times { dist << -1 }
+  q = [] of Int32
+  total = 0_i64
+  seed = 999_u64
+  SOURCES.times do
+    seed = xs_next(seed)
+    src = xs_mod(seed, V.to_i64).to_i32
+    V.times { |v| dist[v] = -1 }
+    q.clear
+    dist[src] = 0
+    q << src
+    qh = 0
+    while qh < q.size
+      u = q[qh]
+      qh += 1
+      d = dist[u]
+      total += d
+      k = start[u]
+      stop = start[u + 1]
+      while k < stop
+        w = out[k]
+        if dist[w] < 0
+          dist[w] = d + 1
+          q << w
+        end
+        k += 1
+      end
+    end
+  end
+  total
+end
+
+def on_tape : Int64
+  total = 0_i64
+  tape do
+    ne = V * DEG
+    esrc = Tape::Array(Int32).new(ne) { 0 }
+    edst = Tape::Array(Int32).new(ne) { 0 }
+    start = Tape::Array(Int32).new(V + 1) { 0 }
+    r = 12345_u64
+    e = 0
+    while e < ne
+      r = xs_next(r)
+      u = xs_mod(r, V.to_i64).to_i32
+      esrc[e] = u
+      edst[e] = xs_mod(r >> 24, V.to_i64).to_i32
+      start[u + 1] = start[u + 1] + 1
+      e += 1
+    end
+    V.times { |v| start[v + 1] = start[v + 1] + start[v] }
+    cursor = Tape::Array(Int32).new(V + 1) { |v| start[v] }
+    out = Tape::Array(Int32).new(ne) { 0 }
+    e = 0
+    while e < ne
+      s = esrc[e]
+      out[cursor[s]] = edst[e]
+      cursor[s] = cursor[s] + 1
+      e += 1
+    end
+    dist = Tape::Array(Int32).new(V) { -1 }
+    # Each vertex joins the queue at most once a search: V slots suffice.
+    q = Tape::Array(Int32).new(V) { 0 }
+    seed = 999_u64
+    SOURCES.times do
+      seed = xs_next(seed)
+      src = xs_mod(seed, V.to_i64).to_i32
+      V.times { |v| dist[v] = -1 }
+      dist[src] = 0
+      q[0] = src
+      qh = 0
+      qt = 1
+      while qh < qt
+        u = q[qh]
+        qh += 1
+        d = dist[u]
+        total += d
+        k = start[u]
+        stop = start[u + 1]
+        while k < stop
+          w = out[k]
+          if dist[w] < 0
+            dist[w] = d + 1
+            q[qt] = w
+            qt += 1
+          end
+          k += 1
+        end
+      end
+    end
+  end
+  total
+end
+
+total = Program.args.size > 0 && Program.args[0] == "tape" ? on_tape : heap
+puts V + V * DEG
+puts total

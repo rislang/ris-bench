@@ -1,0 +1,122 @@
+# bintrees: Goose's bench/goose/bintrees.goose in ris, the Benchmarks Game's
+# binary-trees: many short-lived complete trees built, checked and thrown
+# away, beside one kept for the whole run. Prints what Goose prints.
+#
+#   ./bintrees        # GC heap: a class per node, as idiomatic code has it
+#   ./bintrees tape   # each short-lived tree a pool of index-linked nodes
+#                     # on a tape of its own, freed when it is checked
+#
+# The long-lived tree is a heap pool in the tape version: a tape around the
+# whole run would keep every short tree too, since an inner `tape` frees
+# nothing. Goose frees each tree at its function's return.
+
+module bintrees
+
+import std/int
+
+MAXDEPTH = 17
+MINDEPTH = 4
+
+class TNode
+  getter l : TNode?
+  getter r : TNode?
+
+  def initialize(@l : TNode?, @r : TNode?)
+  end
+end
+
+def make(depth : Int32) : TNode
+  return TNode.new(nil, nil) if depth == 0
+  TNode.new(make(depth - 1), make(depth - 1))
+end
+
+def check(n : TNode) : Int64
+  l = n.l
+  r = n.r
+  return 1_i64 unless l && r
+  1_i64 + check(l) + check(r)
+end
+
+def heap_check(depth : Int32) : Int64
+  check(make(depth))
+end
+
+# A node of a pool: its children's indices, -1 for none.
+struct Node
+  getter l : Int32
+  getter r : Int32
+
+  def initialize(@l : Int32, @r : Int32)
+  end
+end
+
+def make_pool(pool : Tape::Array(Node), depth : Int32) : Int32
+  if depth > 0
+    l = make_pool(pool, depth - 1)
+    r = make_pool(pool, depth - 1)
+  else
+    l = -1
+    r = -1
+  end
+  pool.push(Node.new(l, r))
+  pool.size - 1
+end
+
+def check_pool(pool : Tape::Array(Node), at : Int32) : Int64
+  n = pool[at]
+  return 1_i64 if n.l < 0 || n.r < 0
+  1_i64 + check_pool(pool, n.l) + check_pool(pool, n.r)
+end
+
+def make_heap_pool(pool : Array(Node), depth : Int32) : Int32
+  if depth > 0
+    l = make_heap_pool(pool, depth - 1)
+    r = make_heap_pool(pool, depth - 1)
+  else
+    l = -1
+    r = -1
+  end
+  pool << Node.new(l, r)
+  pool.size - 1
+end
+
+def check_heap_pool(pool : Array(Node), at : Int32) : Int64
+  n = pool[at]
+  return 1_i64 if n.l < 0 || n.r < 0
+  1_i64 + check_heap_pool(pool, n.l) + check_heap_pool(pool, n.r)
+end
+
+def tape_check(depth : Int32) : Int64
+  sum = 0_i64
+  tape do
+    pool = Tape::Array(Node).new((1 << (depth + 1)) - 1)
+    sum = check_pool(pool, make_pool(pool, depth))
+  end
+  sum
+end
+
+on_tape = Program.args.size > 0 && Program.args[0] == "tape"
+puts(on_tape ? tape_check(MAXDEPTH + 1) : heap_check(MAXDEPTH + 1))
+long_root = nil.as(TNode?)
+long_pool = [] of Node
+long_at = 0
+if on_tape
+  long_at = make_heap_pool(long_pool, MAXDEPTH)
+else
+  long_root = make(MAXDEPTH)
+end
+d = MINDEPTH
+while d <= MAXDEPTH
+  iters = 1 << (MAXDEPTH - d + MINDEPTH)
+  sum = 0_i64
+  iters.times { sum += on_tape ? tape_check(d) : heap_check(d) }
+  puts iters
+  puts d
+  puts sum
+  d += 2
+end
+if root = long_root
+  puts check(root)
+else
+  puts check_heap_pool(long_pool, long_at)
+end

@@ -47,3 +47,18 @@ C++ and Rust; `GC.stats` in ris, iyi and Crystal; `runtime.MemStats` in Go.
 
 Ruby's 64-bit hash and PRNG run as Bignum (Bigint in Spinel), most of its
 time. Results: ris's README.md and TAPE_DESIGN.md.
+
+## Algorithmic: `algo.sh`
+
+Three of Goose's own benchmarks, `graph_csr`, `words` and `bintrees`
+(copied from github.com/aardappel/goose, `bench/goose`, Apache 2.0), against
+their ris ports in `ris/`, each run on the GC heap and on the tape. Output is
+checked against Goose's.
+
+    GOOSE=~/goose/build/goose ./algo.sh
+
+| median of 9, 2026-10-19 | Goose | ris tape | ris heap |
+|---|---|---|---|
+| graph_csr | 0.64 s, 109 MB | 1.06 s, 108 MB | 1.06 s, 174 MB |
+| words | 0.22 s, 68 MB | 0.34 s, 90 MB | 0.54 s, 175 MB |
+| bintrees | 0.06 s, 7.9 MB | 0.10 s, 7.1 MB | 0.32 s, 23.8 MB |
