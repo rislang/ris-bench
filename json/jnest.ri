@@ -1,0 +1,704 @@
+module jnest
+
+import std/int
+import std/time::{Time}
+import std/json::{JSON, Any}
+import std/gc::{GC}
+
+# A 4.6 MB JSON document parsed into a tree and walked, in six layouts:
+#   ris build --release json/jnest.ri -o jnest && ./jnest MODE 20000 20
+# MODE:
+#   tstream - std's TapeStream: one stream in document order (simdjson)
+#   stream  - the same by hand
+#   pool    - Goose's layout: one array, children first, index links
+#   heap    - std/json's Any tree on the GC heap
+#   scratch - a TapeArray per node, elements gathered on a stack first
+#   naive   - a TapeArray per node, made at '[' and pushed as parsed
+# The tape parsers are minimal (no escapes or floats); std/json is not.
+# A fourth argument "bytes" prints heap bytes with collection off.
+
+@[OnTape]
+struct JNode
+  getter kind : Int32
+  getter num : Int64
+  getter str : TapeString
+  getter key : TapeString
+  getter items : TapeArray(JNode)
+
+  def initialize(@kind : Int32, @num : Int64, @str : TapeString, @key : TapeString, @items : TapeArray(JNode))
+  end
+
+  def with_key(key : TapeString) : JNode
+    JNode.new(@kind, @num, @str, key, @items)
+  end
+end
+
+# A stack of nodes on the tape that can be cut back.
+@[OnTape]
+struct NodeStack
+  @state : Pointer(UInt64)
+
+  def initialize(capacity : Int32)
+    @state = Pointer(UInt64).new(IyiRegion.tape_bytes(24_u64))
+    @state.value = IyiRegion.tape_bytes(capacity.to_u64 &* sizeof(JNode).to_u64)
+    (@state + 1_i64).value = 0_u64
+    (@state + 2_i64).value = capacity.to_u64
+  end
+
+  def size : Int32
+    (@state + 1_i64).value.to_i32
+  end
+
+  def push(value : JNode) : Nil
+    size = (@state + 1_i64).value
+    if size >= (@state + 2_i64).value
+      capacity = (@state + 2_i64).value &* 2_u64
+      capacity = 1_u64 if capacity == 0_u64
+      old = (@state + 2_i64).value &* sizeof(JNode).to_u64
+      @state.value = IyiRegion.tape_resize(@state.value, @state.value &+ old, size &* sizeof(JNode).to_u64, capacity &* sizeof(JNode).to_u64)
+      (@state + 2_i64).value = capacity
+    end
+    Pointer(JNode).new(@state.value &+ size &* sizeof(JNode).to_u64).value = value
+    (@state + 1_i64).value = size &+ 1_u64
+  end
+
+  def at(index : Int32) : JNode
+    Pointer(JNode).new(@state.value &+ index.to_u64 &* sizeof(JNode).to_u64).value
+  end
+
+  def cut(size : Int32) : Nil
+    (@state + 1_i64).value = size.to_u64
+  end
+end
+
+@[OnTape]
+struct Parser
+  @bytes : Pointer(UInt8)
+  @size : Int32
+  @pos : Int32
+  @scratch : Bool
+  @stack : NodeStack
+
+  def initialize(@bytes : Pointer(UInt8), @size : Int32, @scratch : Bool)
+    @pos = 0
+    @stack = NodeStack.new(64)
+  end
+
+  def empty_str : TapeString
+    TapeString.new(@bytes, 0)
+  end
+
+  def skip_ws : Nil
+    while @pos < @size && (@bytes[@pos] == 32_u8 || @bytes[@pos] == 10_u8)
+      @pos += 1
+    end
+  end
+
+  def scalar(kind : Int32, num : Int64, str : TapeString) : JNode
+    JNode.new(kind, num, str, empty_str, TapeArray(JNode).new(0))
+  end
+
+  def parse_string : TapeString
+    @pos += 1
+    start = @pos
+    while @bytes[@pos] != 34_u8
+      @pos += 1
+    end
+    text = TapeString.new(@bytes + start, @pos - start)
+    @pos += 1
+    text
+  end
+
+  def parse_value : JNode
+    skip_ws
+    c = @bytes[@pos]
+    if c == 91_u8
+      parse_list(93_u8, 5, false)
+    elsif c == 123_u8
+      parse_list(125_u8, 6, true)
+    elsif c == 34_u8
+      scalar(4, 0_i64, parse_string)
+    elsif c == 116_u8
+      @pos += 4
+      scalar(2, 1_i64, empty_str)
+    elsif c == 102_u8
+      @pos += 5
+      scalar(1, 0_i64, empty_str)
+    elsif c == 110_u8
+      @pos += 4
+      scalar(0, 0_i64, empty_str)
+    else
+      n = 0_i64
+      while @pos < @size && @bytes[@pos] >= 48_u8 && @bytes[@pos] <= 57_u8
+        n = n &* 10 &+ (@bytes[@pos] - 48_u8).to_i64
+        @pos += 1
+      end
+      scalar(3, n, empty_str)
+    end
+  end
+
+  def parse_member(object : Bool) : JNode
+    if object
+      skip_ws
+      key = parse_string
+      skip_ws
+      @pos += 1
+      parse_value.with_key(key)
+    else
+      parse_value
+    end
+  end
+
+  def parse_list(close : UInt8, kind : Int32, object : Bool) : JNode
+    @pos += 1
+    if @scratch
+      base = @stack.size
+      skip_ws
+      if @bytes[@pos] == close
+        @pos += 1
+      else
+        while true
+          @stack.push(parse_member(object))
+          skip_ws
+          c = @bytes[@pos]
+          @pos += 1
+          break if c == close
+        end
+      end
+      count = @stack.size - base
+      items = TapeArray(JNode).new(count)
+      i = 0
+      while i < count
+        items.push(@stack.at(base + i))
+        i += 1
+      end
+      @stack.cut(base)
+    else
+      items = TapeArray(JNode).new(4)
+      skip_ws
+      if @bytes[@pos] == close
+        @pos += 1
+      else
+        while true
+          items.push(parse_member(object))
+          skip_ws
+          c = @bytes[@pos]
+          @pos += 1
+          break if c == close
+        end
+      end
+    end
+    JNode.new(kind, 0_i64, empty_str, empty_str, items)
+  end
+end
+
+def walk(node : JNode) : Int64
+  sum = node.num &+ node.str.bytesize.to_i64 &+ node.key.bytesize.to_i64 &+ node.kind.to_i64
+  node.items.each do |child|
+    sum = sum &+ walk(child) &* 3
+  end
+  sum
+end
+
+# pool - Goose's layout: every node in one growing array, children before
+#        their parent, siblings chained by index, the only tape growth.
+@[OnTape]
+struct PNode
+  getter kind : Int32
+  getter num : Int64
+  getter str : TapeString
+  getter key : TapeString
+  getter next : Int32
+  getter first : Int32
+  getter count : Int32
+
+  def initialize(@kind : Int32, @num : Int64, @str : TapeString, @key : TapeString, @next : Int32, @first : Int32, @count : Int32)
+  end
+
+  def linked(to : Int32) : PNode
+    PNode.new(@kind, @num, @str, @key, to, @first, @count)
+  end
+end
+
+@[OnTape]
+struct Pool
+  @state : Pointer(UInt64)
+
+  def initialize(capacity : Int32)
+    @state = Pointer(UInt64).new(IyiRegion.tape_bytes(24_u64))
+    @state.value = IyiRegion.tape_bytes(capacity.to_u64 &* sizeof(PNode).to_u64)
+    (@state + 1_i64).value = 0_u64
+    (@state + 2_i64).value = capacity.to_u64
+  end
+
+  def size : Int32
+    (@state + 1_i64).value.to_i32
+  end
+
+  def push(value : PNode) : Int32
+    size = (@state + 1_i64).value
+    if size >= (@state + 2_i64).value
+      capacity = (@state + 2_i64).value &* 2_u64
+      capacity = 1_u64 if capacity == 0_u64
+      old = (@state + 2_i64).value &* sizeof(PNode).to_u64
+      @state.value = IyiRegion.tape_resize(@state.value, @state.value &+ old, size &* sizeof(PNode).to_u64, capacity &* sizeof(PNode).to_u64)
+      (@state + 2_i64).value = capacity
+    end
+    Pointer(PNode).new(@state.value &+ size &* sizeof(PNode).to_u64).value = value
+    (@state + 1_i64).value = size &+ 1_u64
+    size.to_i32
+  end
+
+  def at(index : Int32) : PNode
+    Pointer(PNode).new(@state.value &+ index.to_u64 &* sizeof(PNode).to_u64).value
+  end
+
+  def link(index : Int32, to : Int32) : Nil
+    slot = Pointer(PNode).new(@state.value &+ index.to_u64 &* sizeof(PNode).to_u64)
+    slot.value = slot.value.linked(to)
+  end
+end
+
+@[OnTape]
+struct PoolParser
+  @bytes : Pointer(UInt8)
+  @size : Int32
+  @pos : Int32
+  getter pool : Pool
+
+  def initialize(@bytes : Pointer(UInt8), @size : Int32)
+    @pos = 0
+    @pool = Pool.new(1024)
+  end
+
+  def empty_str : TapeString
+    TapeString.new(@bytes, 0)
+  end
+
+  def skip_ws : Nil
+    while @pos < @size && (@bytes[@pos] == 32_u8 || @bytes[@pos] == 10_u8)
+      @pos += 1
+    end
+  end
+
+  def parse_string : TapeString
+    @pos += 1
+    start = @pos
+    while @bytes[@pos] != 34_u8
+      @pos += 1
+    end
+    text = TapeString.new(@bytes + start, @pos - start)
+    @pos += 1
+    text
+  end
+
+  def leaf(kind : Int32, num : Int64, str : TapeString, key : TapeString) : Int32
+    @pool.push(PNode.new(kind, num, str, key, -1, -1, 0))
+  end
+
+  def parse_value(key : TapeString) : Int32
+    skip_ws
+    c = @bytes[@pos]
+    if c == 91_u8 || c == 123_u8
+      object = c == 123_u8
+      close = object ? 125_u8 : 93_u8
+      @pos += 1
+      first = -1
+      last = -1
+      count = 0
+      skip_ws
+      if @bytes[@pos] == close
+        @pos += 1
+      else
+        while true
+          child = parse_member(object)
+          if last < 0
+            first = child
+          else
+            @pool.link(last, child)
+          end
+          last = child
+          count += 1
+          skip_ws
+          c = @bytes[@pos]
+          @pos += 1
+          break if c == close
+        end
+      end
+      @pool.push(PNode.new(object ? 6 : 5, 0_i64, empty_str, key, -1, first, count))
+    elsif c == 34_u8
+      leaf(4, 0_i64, parse_string, key)
+    elsif c == 116_u8
+      @pos += 4
+      leaf(2, 1_i64, empty_str, key)
+    elsif c == 102_u8
+      @pos += 5
+      leaf(1, 0_i64, empty_str, key)
+    elsif c == 110_u8
+      @pos += 4
+      leaf(0, 0_i64, empty_str, key)
+    else
+      n = 0_i64
+      while @pos < @size && @bytes[@pos] >= 48_u8 && @bytes[@pos] <= 57_u8
+        n = n &* 10 &+ (@bytes[@pos] - 48_u8).to_i64
+        @pos += 1
+      end
+      leaf(3, n, empty_str, key)
+    end
+  end
+
+  def parse_member(object : Bool) : Int32
+    return parse_value(empty_str) unless object
+    skip_ws
+    key = parse_string
+    skip_ws
+    @pos += 1
+    parse_value(key)
+  end
+end
+
+# stream - simdjson's layout: one growing array in document order; a
+#          container is written when it opens and patched when it closes
+#          with the index past its subtree (in PNode#next), so a reader
+#          steps over a child in one jump.
+@[OnTape]
+struct StreamParser
+  @bytes : Pointer(UInt8)
+  @size : Int32
+  @pos : Int32
+  getter pool : Pool
+
+  def initialize(@bytes : Pointer(UInt8), @size : Int32)
+    @pos = 0
+    @pool = Pool.new(1024)
+  end
+
+  def empty_str : TapeString
+    TapeString.new(@bytes, 0)
+  end
+
+  def skip_ws : Nil
+    while @pos < @size && (@bytes[@pos] == 32_u8 || @bytes[@pos] == 10_u8)
+      @pos += 1
+    end
+  end
+
+  def parse_string : TapeString
+    @pos += 1
+    start = @pos
+    while @bytes[@pos] != 34_u8
+      @pos += 1
+    end
+    text = TapeString.new(@bytes + start, @pos - start)
+    @pos += 1
+    text
+  end
+
+  def leaf(kind : Int32, num : Int64, str : TapeString, key : TapeString) : Nil
+    @pool.push(PNode.new(kind, num, str, key, @pool.size + 1, -1, 0))
+  end
+
+  def parse_value(key : TapeString) : Nil
+    skip_ws
+    c = @bytes[@pos]
+    if c == 91_u8 || c == 123_u8
+      object = c == 123_u8
+      close = object ? 125_u8 : 93_u8
+      @pos += 1
+      at = @pool.push(PNode.new(object ? 6 : 5, 0_i64, empty_str, key, -1, -1, 0))
+      skip_ws
+      if @bytes[@pos] == close
+        @pos += 1
+      else
+        while true
+          parse_member(object)
+          skip_ws
+          c = @bytes[@pos]
+          @pos += 1
+          break if c == close
+        end
+      end
+      @pool.link(at, @pool.size)
+    elsif c == 34_u8
+      leaf(4, 0_i64, parse_string, key)
+    elsif c == 116_u8
+      @pos += 4
+      leaf(2, 1_i64, empty_str, key)
+    elsif c == 102_u8
+      @pos += 5
+      leaf(1, 0_i64, empty_str, key)
+    elsif c == 110_u8
+      @pos += 4
+      leaf(0, 0_i64, empty_str, key)
+    else
+      n = 0_i64
+      while @pos < @size && @bytes[@pos] >= 48_u8 && @bytes[@pos] <= 57_u8
+        n = n &* 10 &+ (@bytes[@pos] - 48_u8).to_i64
+        @pos += 1
+      end
+      leaf(3, n, empty_str, key)
+    end
+  end
+
+  def parse_member(object : Bool) : Nil
+    return parse_value(empty_str) unless object
+    skip_ws
+    key = parse_string
+    skip_ws
+    @pos += 1
+    parse_value(key)
+  end
+end
+
+# tstream - the stream layout through std's TapeStream(T).
+@[OnTape]
+struct SNode
+  getter kind : Int32
+  getter num : Int64
+  getter str : TapeString
+  getter key : TapeString
+
+  def initialize(@kind : Int32, @num : Int64, @str : TapeString, @key : TapeString)
+  end
+end
+
+@[OnTape]
+struct TStreamParser
+  @bytes : Pointer(UInt8)
+  @size : Int32
+  @pos : Int32
+  getter tree : TapeStream(SNode)
+
+  def initialize(@bytes : Pointer(UInt8), @size : Int32)
+    @pos = 0
+    @tree = TapeStream(SNode).new(1024)
+  end
+
+  def empty_str : TapeString
+    TapeString.new(@bytes, 0)
+  end
+
+  def skip_ws : Nil
+    while @pos < @size && (@bytes[@pos] == 32_u8 || @bytes[@pos] == 10_u8)
+      @pos += 1
+    end
+  end
+
+  def parse_string : TapeString
+    @pos += 1
+    start = @pos
+    while @bytes[@pos] != 34_u8
+      @pos += 1
+    end
+    text = TapeString.new(@bytes + start, @pos - start)
+    @pos += 1
+    text
+  end
+
+  def parse_value(key : TapeString) : Nil
+    skip_ws
+    c = @bytes[@pos]
+    if c == 91_u8 || c == 123_u8
+      object = c == 123_u8
+      close = object ? 125_u8 : 93_u8
+      @pos += 1
+      at = @tree.open(SNode.new(object ? 6 : 5, 0_i64, empty_str, key))
+      skip_ws
+      if @bytes[@pos] == close
+        @pos += 1
+      else
+        while true
+          parse_member(object)
+          skip_ws
+          c = @bytes[@pos]
+          @pos += 1
+          break if c == close
+        end
+      end
+      @tree.close(at)
+    elsif c == 34_u8
+      @tree.leaf(SNode.new(4, 0_i64, parse_string, key))
+    elsif c == 116_u8
+      @pos += 4
+      @tree.leaf(SNode.new(2, 1_i64, empty_str, key))
+    elsif c == 102_u8
+      @pos += 5
+      @tree.leaf(SNode.new(1, 0_i64, empty_str, key))
+    elsif c == 110_u8
+      @pos += 4
+      @tree.leaf(SNode.new(0, 0_i64, empty_str, key))
+    else
+      n = 0_i64
+      while @pos < @size && @bytes[@pos] >= 48_u8 && @bytes[@pos] <= 57_u8
+        n = n &* 10 &+ (@bytes[@pos] - 48_u8).to_i64
+        @pos += 1
+      end
+      @tree.leaf(SNode.new(3, n, empty_str, key))
+    end
+  end
+
+  def parse_member(object : Bool) : Nil
+    return parse_value(empty_str) unless object
+    skip_ws
+    key = parse_string
+    skip_ws
+    @pos += 1
+    parse_value(key)
+  end
+end
+
+def walk_tstream(tree : TapeStream(SNode), index : Int32) : Int64
+  node = tree[index]
+  sum = node.num &+ node.str.bytesize.to_i64 &+ node.key.bytesize.to_i64 &+ node.kind.to_i64
+  if node.kind >= 5
+    tree.each_child(index) do |child|
+      sum = sum &+ walk_tstream(tree, child) &* 3
+    end
+  end
+  sum
+end
+
+def walk_stream(pool : Pool, index : Int32) : Int64
+  node = pool.at(index)
+  sum = node.num &+ node.str.bytesize.to_i64 &+ node.key.bytesize.to_i64 &+ node.kind.to_i64
+  if node.kind >= 5
+    child = index + 1
+    stop = node.next
+    while child < stop
+      sum = sum &+ walk_stream(pool, child) &* 3
+      child = pool.at(child).next
+    end
+  end
+  sum
+end
+
+def walk_pool(pool : Pool, index : Int32) : Int64
+  node = pool.at(index)
+  sum = node.num &+ node.str.bytesize.to_i64 &+ node.key.bytesize.to_i64 &+ node.kind.to_i64
+  child = node.first
+  while child >= 0
+    sum = sum &+ walk_pool(pool, child) &* 3
+    child = pool.at(child).next
+  end
+  sum
+end
+
+# heap - std/json's Any tree on the collected heap, the same checksum.
+def walk_any(node : Any, key : Int64) : Int64
+  raw = node.raw
+  sum = key
+  case raw
+  when Nil
+    sum = sum &+ 0
+  when Bool
+    sum = sum &+ (raw ? 3 : 1)
+  when Int64
+    sum = sum &+ raw &+ 3
+  when String
+    sum = sum &+ raw.bytesize.to_i64 &+ 4
+  when Array(Any)
+    sum = sum &+ 5
+    raw.each { |child| sum = sum &+ walk_any(child, 0_i64) &* 3 }
+  when Hash(String, Any)
+    sum = sum &+ 6
+    raw.each { |k, child| sum = sum &+ walk_any(child, k.bytesize.to_i64) &* 3 }
+  end
+  sum
+end
+
+def xs_next(x : UInt64) : UInt64
+  v = x
+  v = v ^ (v << 13)
+  v = v ^ (v >> 7)
+  v = v ^ (v << 17)
+  v
+end
+
+def document(records : Int32) : String
+  x = 88172645463325252_u64
+  String.build do |io|
+    io << "[\n"
+    records.times do |r|
+      io << ",\n" if r > 0
+      io << "{\"id\":" << r << ",\"name\":\"user" << r << "\",\"tags\":["
+      x = xs_next(x)
+      (x % 12_u64).to_i32.times do |t|
+        io << "," if t > 0
+        io << "\"tag" << t << "\""
+      end
+      io << "],\"rows\":["
+      x = xs_next(x)
+      rows = (x % 5_u64).to_i32 + 1
+      rows.times do |i|
+        io << "," if i > 0
+        io << "["
+        x = xs_next(x)
+        ((x % 8_u64).to_i32 + 1).times do |j|
+          io << "," if j > 0
+          io << (r &* 7 &+ i &* 3 &+ j)
+        end
+        io << "]"
+      end
+      io << "],\"meta\":{\"active\":" << (r % 2 == 0 ? "true" : "false")
+      io << ",\"parent\":null,\"scores\":[" << r % 97 << "," << r % 13 << "]}}"
+    end
+    io << "\n]\n"
+  end
+end
+
+mode = Program.args.size > 0 ? Program.args[0] : "naive"
+records = Program.args.size > 1 ? Program.args[1].to_i : 20000
+rounds = Program.args.size > 2 ? Program.args[2].to_i : 20
+text = document(records)
+total = 0_i64
+gc_before = GC.stats.collections
+start = Time.monotonic
+if Program.args.size > 3 && Program.args[3] == "bytes"
+  GC.disable
+  before = IyiMark.allocated_since
+  pool_bytes = 0_i64
+  if mode == "heap"
+    total = walk_any(JSON.parse(text), 0_i64)
+  elsif mode != "pool"
+    Tape.scope do
+      parser = Parser.new(text.to_unsafe, text.bytesize, mode == "scratch")
+      total = walk(parser.parse_value)
+    end
+  else
+    Tape.scope do
+      pp = PoolParser.new(text.to_unsafe, text.bytesize)
+      root = pp.parse_value(pp.empty_str)
+      total = walk_pool(pp.pool, root)
+      pool_bytes = pp.pool.size.to_i64 &* sizeof(PNode).to_i64
+    end
+  end
+  heap = IyiMark.allocated_since - before
+  puts "#{mode}: checksum #{total}, heap bytes #{heap}, pool bytes written #{pool_bytes}"
+  exit 0
+end
+rounds.times do
+  if mode == "heap"
+    total = total &+ walk_any(JSON.parse(text), 0_i64)
+    next
+  end
+  Tape.scope do
+    if mode == "tstream"
+      tp = TStreamParser.new(text.to_unsafe, text.bytesize)
+      tp.parse_value(tp.empty_str)
+      total = total &+ walk_tstream(tp.tree, 0)
+    elsif mode == "stream"
+      sp = StreamParser.new(text.to_unsafe, text.bytesize)
+      sp.parse_value(sp.empty_str)
+      total = total &+ walk_stream(sp.pool, 0)
+    elsif mode == "pool"
+      pp = PoolParser.new(text.to_unsafe, text.bytesize)
+      root = pp.parse_value(pp.empty_str)
+      total = total &+ walk_pool(pp.pool, root)
+    else
+      parser = Parser.new(text.to_unsafe, text.bytesize, mode == "scratch")
+      total = total &+ walk(parser.parse_value)
+    end
+  end
+end
+elapsed = Time.monotonic - start
+puts "#{mode}: #{text.bytesize} bytes x #{rounds}, checksum #{total}, #{elapsed.total_milliseconds.round(1)} ms, collections #{GC.stats.collections - gc_before}"
