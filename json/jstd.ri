@@ -2,7 +2,7 @@ module jstd
 
 import std/int
 import std/time::{Time}
-import std/json::{JSON, Any, Document, TapeWriter}
+import std/json::{JSON, Any, Document}
 import std/gc::{GC}
 
 # std/json on the heap and on the tape (ris 851a3fdd3 or newer):
