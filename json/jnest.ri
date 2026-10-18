@@ -5,7 +5,7 @@ import std/time::{Time}
 import std/json::{JSON, Any}
 import std/gc::{GC}
 
-# A 4.6 MB JSON document parsed into a tree and walked, in six layouts:
+# A 4.6 MB JSON document parsed into a tree and walked, in five layouts:
 #   ris build --release json/jnest.ri -o jnest && ./jnest MODE 20000 20
 # MODE:
 #   tstream - std's TapeStream: one stream in document order (simdjson)
@@ -13,7 +13,8 @@ import std/gc::{GC}
 #   pool    - Goose's layout: one array, children first, index links
 #   heap    - std/json's Any tree on the GC heap
 #   scratch - a TapeArray per node, elements gathered on a stack first
-#   naive   - a TapeArray per node, made at '[' and pushed as parsed
+# A sixth, a TapeArray per node made at '[' and pushed as parsed (1749 ms,
+# TAPE_DESIGN.md), is the layout ris now refuses (TapeLayoutChecker).
 # The tape parsers are minimal (no escapes or floats); std/json is not.
 # A fourth argument "bytes" prints heap bytes with collection off.
 
@@ -76,10 +77,9 @@ struct Parser
   @bytes : Pointer(UInt8)
   @size : Int32
   @pos : Int32
-  @scratch : Bool
   @stack : NodeStack
 
-  def initialize(@bytes : Pointer(UInt8), @size : Int32, @scratch : Bool)
+  def initialize(@bytes : Pointer(UInt8), @size : Int32)
     @pos = 0
     @stack = NodeStack.new(64)
   end
@@ -151,43 +151,22 @@ struct Parser
 
   def parse_list(close : UInt8, kind : Int32, object : Bool) : JNode
     @pos += 1
-    if @scratch
-      base = @stack.size
-      skip_ws
-      if @bytes[@pos] == close
-        @pos += 1
-      else
-        while true
-          @stack.push(parse_member(object))
-          skip_ws
-          c = @bytes[@pos]
-          @pos += 1
-          break if c == close
-        end
-      end
-      count = @stack.size - base
-      items = TapeArray(JNode).new(count)
-      i = 0
-      while i < count
-        items.push(@stack.at(base + i))
-        i += 1
-      end
-      @stack.cut(base)
+    base = @stack.size
+    skip_ws
+    if @bytes[@pos] == close
+      @pos += 1
     else
-      items = TapeArray(JNode).new(4)
-      skip_ws
-      if @bytes[@pos] == close
+      while true
+        @stack.push(parse_member(object))
+        skip_ws
+        c = @bytes[@pos]
         @pos += 1
-      else
-        while true
-          items.push(parse_member(object))
-          skip_ws
-          c = @bytes[@pos]
-          @pos += 1
-          break if c == close
-        end
+        break if c == close
       end
     end
+    count = @stack.size - base
+    items = TapeArray(JNode).new(count) { |i| @stack.at(base + i) }
+    @stack.cut(base)
     JNode.new(kind, 0_i64, empty_str, empty_str, items)
   end
 end
@@ -646,7 +625,7 @@ def document(records : Int32) : String
   end
 end
 
-mode = Program.args.size > 0 ? Program.args[0] : "naive"
+mode = Program.args.size > 0 ? Program.args[0] : "tstream"
 records = Program.args.size > 1 ? Program.args[1].to_i : 20000
 rounds = Program.args.size > 2 ? Program.args[2].to_i : 20
 text = document(records)
@@ -661,7 +640,7 @@ if Program.args.size > 3 && Program.args[3] == "bytes"
     total = walk_any(JSON.parse(text), 0_i64)
   elsif mode != "pool"
     Tape.scope do
-      parser = Parser.new(text.to_unsafe, text.bytesize, mode == "scratch")
+      parser = Parser.new(text.to_unsafe, text.bytesize)
       total = walk(parser.parse_value)
     end
   else
@@ -695,7 +674,7 @@ rounds.times do
       root = pp.parse_value(pp.empty_str)
       total = total &+ walk_pool(pp.pool, root)
     else
-      parser = Parser.new(text.to_unsafe, text.bytesize, mode == "scratch")
+      parser = Parser.new(text.to_unsafe, text.bytesize)
       total = total &+ walk(parser.parse_value)
     end
   end
