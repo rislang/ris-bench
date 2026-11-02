@@ -1,0 +1,2534 @@
+# jq core: Goose's nine-byte cells and packed values on a reusable tape.
+
+import std/int
+import std/io
+import std/float
+
+def read_stream(io : IyiIO) : String
+  String.build(4096) do |writer|
+    while line = io.read_line_tape
+      writer.append(line)
+    end
+  end
+end
+
+POW10 = {1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10,
+         1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22}
+
+# Match Goose's decimal conversion, including its stepwise scaling for large
+# exponents (which can differ by an ulp from a correctly rounded conversion).
+def parse_float(s : String) : Float64
+  i = 0
+  neg = false
+  if s.bytesize > 0 && (s[0] == 45 || s[0] == 43)
+    neg = s[0] == 45
+    i = 1
+  end
+  start = i
+  mant = 0_u64
+  while i < s.bytesize && s[i] >= 48 && s[i] <= 57
+    mant = mant &* 10 &+ (s[i] - 48).to_u64
+    i += 1
+  end
+  digits = i - start
+  exp10 = 0
+  if i < s.bytesize && s[i] == 46
+    i += 1
+    fstart = i
+    while i < s.bytesize && s[i] >= 48 && s[i] <= 57
+      mant = mant &* 10 &+ (s[i] - 48).to_u64
+      i += 1
+    end
+    exp10 = fstart - i
+    digits -= exp10
+  end
+  raise "bad number" if digits == 0
+  if digits <= 19 && i == s.bytesize
+    v = mant.to_f64
+    v /= POW10[-exp10] if exp10 < 0
+    return neg ? -v : v
+  end
+  if digits > 19
+    mant = 0_u64
+    exp10 = 0
+    mdigits = 0
+    j = start
+    while j < s.bytesize && s[j] == 48
+      j += 1
+    end
+    while j < s.bytesize && s[j] >= 48 && s[j] <= 57
+      if mdigits < 19
+        mant = mant &* 10 &+ (s[j] - 48).to_u64
+        mdigits += 1
+      else
+        exp10 += 1
+      end
+      j += 1
+    end
+    if j < s.bytesize && s[j] == 46
+      j += 1
+      if mant == 0
+        while j < s.bytesize && s[j] == 48
+          exp10 -= 1
+          j += 1
+        end
+      end
+      while j < s.bytesize && s[j] >= 48 && s[j] <= 57
+        if mdigits < 19
+          mant = mant &* 10 &+ (s[j] - 48).to_u64
+          mdigits += 1
+          exp10 -= 1
+        end
+        j += 1
+      end
+    end
+  end
+  if i < s.bytesize && (s[i] == 101 || s[i] == 69)
+    i += 1
+    eneg = false
+    if i < s.bytesize && (s[i] == 45 || s[i] == 43)
+      eneg = s[i] == 45
+      i += 1
+    end
+    e = 0
+    edigits = 0
+    while i < s.bytesize && s[i] >= 48 && s[i] <= 57
+      e = e * 10 + (s[i] - 48).to_i32 if e < 100000
+      edigits += 1
+      i += 1
+    end
+    raise "bad number" if edigits == 0
+    exp10 += eneg ? -e : e
+  end
+  v = mant.to_f64
+  e = exp10
+  while e > 22
+    v *= 1e22
+    e -= 22
+  end
+  while e < -22
+    v /= 1e22
+    e += 22
+  end
+  v *= POW10[e] if e > 0
+  v /= POW10[-e] if e < 0
+  raise "bad number" unless i == s.bytesize
+  neg ? -v : v
+end
+
+struct Cell
+  getter tag : Int32
+  getter bits : UInt64
+
+  def initialize(@tag : Int32 = 0, @bits : UInt64 = 0_u64)
+  end
+
+  def self.num(v : Number) : Cell
+    Cell.new(3, IyiFloatText.bits_of(v.to_f))
+  end
+
+  def self.bool(v : Bool) : Cell
+    Cell.new(v ? 2 : 1)
+  end
+
+  def number : Float64
+    raise "number expected" unless @tag == 3
+    IyiFloatText.from_bits(@bits)
+  end
+
+  def truthy : Bool
+    @tag != 0 && @tag != 1
+  end
+end
+
+# The filter is compiled once; references are indices, as in the Goose AST.
+@[OnTape]
+struct Node
+  getter kind : String
+  getter a : Int32
+  getter b : Int32
+  getter c : Int32
+  getter d : Int32
+  getter id : Int32
+  getter text : String
+  getter value : Cell
+  getter args : SlicePool::Run(Int32)
+
+  def initialize(@args : SlicePool::Run(Int32),
+                 @kind : String, @a : Int32 = -1, @b : Int32 = -1,
+                 @c : Int32 = -1, @d : Int32 = -1, @id : Int32 = -1,
+                 @text : String = "", @value : Cell = Cell.new)
+  end
+end
+
+@[OnTape]
+struct Definition
+  getter params : SlicePool::List(Int32)
+  property body : Int32
+
+  def initialize(pool : SlicePool(Int32?))
+    @params = SlicePool::List(Int32).new(pool)
+    @body = -1
+  end
+end
+
+@[OnTape]
+struct Parser
+  getter nodes : Array(Node)
+  getter defs : Array(Definition)
+  @scope : Array(Tuple(Int32, Int32, Int32, Int32, Int32))
+  @fs : String::Scanner
+  @nvars : Int32
+
+  def initialize(src : String)
+    @arguments = SlicePool(Int32).new(64)
+    @parameters = SlicePool(Int32?).new(32)
+    @nodes = Array(Node).new(64)
+    @nodes << Node.new(@arguments.alloc_slice(0), "Ident")
+    @defs = Array(Definition).new
+    @scope = Array(Tuple(Int32, Int32, Int32, Int32, Int32)).new
+    @fs = String::Scanner.new(src)
+    @nvars = 0
+    @arglinks = Array(Tuple(Int32, Int32)).new(64)
+    @arglists = Array(SlicePool::Run(Int32)).new(32)
+  end
+
+  def node(kind : String, a : Int32 = -1, b : Int32 = -1, c : Int32 = -1,
+           d : Int32 = -1, id : Int32 = -1, text : String = "",
+           value : Cell = Cell.new,
+           args : SlicePool::Run(Int32) = @arguments.alloc_slice(0)) : Int32
+    @nodes << Node.new(args, kind, a, b, c, d, id, text, value)
+    @nodes.size - 1
+  end
+
+  def fail(message : String) : NoReturn
+    raise "filter syntax: #{message} at byte #{@fs.offset} in: " \
+          "#{@fs.string}"
+  end
+
+  def skipws : Nil
+    while @fs.offset < @fs.string.bytesize
+      c = @fs.string[@fs.offset].to_u8
+      if c == 32 || c == 10 || c == 9 || c == 13
+        @fs.advance(1)
+      elsif c == 35
+        while @fs.offset < @fs.string.bytesize && \
+                 @fs.string[@fs.offset].to_u8 != 10
+          @fs.advance(1)
+        end
+      else
+        break
+      end
+    end
+  end
+
+  def id0(c : UInt8) : Bool
+    (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95
+  end
+
+  def idchar(c : UInt8) : Bool
+    id0(c) || (c >= 48 && c <= 57)
+  end
+
+  def peek : UInt8
+    skipws
+    @fs.offset < @fs.string.bytesize ? @fs.string[@fs.offset].to_u8 : 0_u8
+  end
+
+  def peek2 : UInt8
+    @fs.offset + 1 < @fs.string.bytesize ? @fs.string[@fs.offset + 1].to_u8 : 0_u8
+  end
+
+  def eat(s : String) : Bool
+    skipws
+    if @fs.offset + s.bytesize <= @fs.string.bytesize && \
+          @fs.string[@fs.offset, s.bytesize] == s
+      @fs.advance(s.bytesize)
+      return true
+    end
+    false
+  end
+
+  def expect(s : String) : Nil
+    fail("expected '#{s}'") unless eat(s)
+  end
+
+  def ident_at : String
+    skipws
+    return "" unless @fs.offset < @fs.string.bytesize && \
+                        id0(@fs.string[@fs.offset].to_u8)
+    e = @fs.offset + 1
+    while e < @fs.string.bytesize && idchar(@fs.string[e].to_u8)
+      e += 1
+    end
+    @fs.string[@fs.offset, e - @fs.offset]
+  end
+
+  def kw(s : String) : Bool
+    return false unless ident_at == s
+    @fs.advance(s.bytesize)
+    true
+  end
+
+  def ident : String
+    start, len = ident_pos
+    @fs.string[start, len]
+  end
+
+  # Where the identifier is in the filter: scope entries keep positions.
+  def ident_pos : {Int32, Int32}
+    w = ident_at
+    fail("identifier expected") if w.empty? || w.bytesize > 32
+    start = @fs.offset
+    @fs.advance(w.bytesize)
+    {start, w.bytesize}
+  end
+
+  def variable : String
+    expect("$")
+    ident
+  end
+
+  def variable_pos : {Int32, Int32}
+    expect("$")
+    ident_pos
+  end
+
+  def bind(pos : {Int32, Int32}) : Int32
+    id = @nvars
+    @nvars += 1
+    @scope << {pos[0], pos[1], 0, id, 0}
+    id
+  end
+
+  def lookup(name : String, kind : Int32, arity : Int32) : Int32
+    i = @scope.size - 1
+    while i >= 0
+      s = @scope[i]
+      if s[2] == kind && s[4] == arity && @fs.string[s[0], s[1]] == name
+        return s[3]
+      end
+      i -= 1
+    end
+    -1
+  end
+
+  def unscope(mark : Int32) : Nil
+    while @scope.size > mark
+      @scope.pop
+    end
+  end
+
+  def hex4 : Int32
+    fail("short Unicode escape") if @fs.offset + 4 > \
+                                      @fs.string.bytesize
+    v = 0
+    4.times do |i|
+      c = @fs.string[@fs.offset + i]
+      d = c <= 57 ? c - 48 : (c <= 70 ? c - 55 : c - 87)
+      v = v * 16 + d
+    end
+    @fs.advance(4)
+    v
+  end
+
+  def string : String
+    expect("\"")
+    String.build(@fs.string.bytesize) do |dest|
+      loop do
+        fail("unterminated string") if @fs.offset >= \
+                                         @fs.string.bytesize
+        c = @fs.string[@fs.offset].to_u8
+        @fs.advance(1)
+        break if c == 34
+        if c != 92
+          dest.push(c)
+          next
+        end
+        e = @fs.string[@fs.offset].to_u8
+        @fs.advance(1)
+        case e
+        when 110 then dest.push(10_u8)
+        when 116 then dest.push(9_u8)
+        when 114 then dest.push(13_u8)
+        when  98 then dest.push(8_u8)
+        when 102 then dest.push(12_u8)
+        when 117
+          cp = hex4
+          if cp >= 0xD800 && cp < 0xDC00 && @fs.offset + 1 < \
+               @fs.string.bytesize &&
+               @fs.string[@fs.offset, 2] == "\\u"
+            @fs.advance(2)
+            lo = hex4
+            if lo >= 0xDC00 && lo < 0xE000
+              cp = 0x10000 + ((cp - 0xD800) << 10) + lo - 0xDC00
+            else
+              dest << 0xFFFD.chr
+              cp = lo
+            end
+          end
+          cp = 0xFFFD if cp >= 0xD800 && cp < 0xE000
+          dest << cp.chr
+        else
+          dest.push(e)
+        end
+      end
+    end
+  end
+
+  def parse : Int32
+    root = pipe
+    skipws
+    fail("unexpected text") unless @fs.offset == \
+                                     @fs.string.bytesize
+    root
+  end
+
+  def pipe : Int32
+    if kw("def")
+      name = ident_pos
+      sm = @scope.size
+      params = Array(Tuple(Int32, Int32)).new
+      if eat("(")
+        loop do
+          params << variable_pos
+          next if eat(";")
+          expect(")")
+          break
+        end
+      end
+      d = Definition.new(@parameters)
+      fid = @defs.size
+      @defs << d
+      @scope << {name[0], name[1], 1, fid, params.size}
+      inner = @scope.size
+      params.each { |pn| d.params << bind(pn) }
+      expect(":")
+      d.body = pipe
+      @defs[fid] = d
+      expect(";")
+      unscope(inner)
+      rest = pipe
+      unscope(sm)
+      return rest
+    end
+    save = @fs.offset
+    return pipe_rest if peek == 45
+    t = postfix
+    if kw("as")
+      sm = @scope.size
+      id = bind(variable_pos)
+      expect("|")
+      body = pipe
+      unscope(sm)
+      return node("As", t, body, id: id)
+    end
+    @fs.offset = save
+    pipe_rest
+  end
+
+  def pipe_rest : Int32
+    l = comma
+    if peek == 124 && peek2 != 61
+      @fs.advance(1)
+      return node("Pipe", l, pipe)
+    end
+    l
+  end
+
+  def comma : Int32
+    l = alt
+    while eat(",")
+      l = node("Comma", l, alt)
+    end
+    l
+  end
+
+  def alt : Int32
+    l = por
+    eat("//") ? node("Alt", l, alt) : l
+  end
+
+  def por : Int32
+    l = pand
+    while kw("or")
+      l = node("Or", l, pand)
+    end
+    l
+  end
+
+  def pand : Int32
+    l = comparison
+    while kw("and")
+      l = node("And", l, comparison)
+    end
+    l
+  end
+
+  def comparison : Int32
+    l = addition
+    op = if eat("==")
+           "e"
+         elsif eat("!=")
+           "n"
+         elsif eat("<=")
+           "l"
+         elsif eat(">=")
+           "g"
+         elsif eat("<")
+           "<"
+         elsif eat(">")
+           ">"
+         else
+           ""
+         end
+    op.empty? ? l : node("Bin", l, addition, text: op)
+  end
+
+  def addition : Int32
+    l = multiply
+    loop do
+      c = peek
+      break unless (c == 43 || c == 45) && peek2 != 61
+      @fs.advance(1)
+      l = node("Bin", l, multiply, text: op_text(c))
+    end
+    l
+  end
+
+  # The operator's text as a literal, so a node keeps no built string.
+  def op_text(c : UInt8) : String
+    case c
+    when 43 then "+"
+    when 45 then "-"
+    when 42 then "*"
+    when 47 then "/"
+    else         "%"
+    end
+  end
+
+  def multiply : Int32
+    l = unary
+    loop do
+      c = peek
+      break unless (c == 42 || c == 37 || (c == 47 && peek2 != 47)) && peek2 \
+                     != 61
+      @fs.advance(1)
+      l = node("Bin", l, unary, text: op_text(c))
+    end
+    l
+  end
+
+  def unary : Int32
+    return postfix unless eat("-")
+    node("Neg", postfix)
+  end
+
+  def bracket(t : Int32) : Int32
+    return node("Iter", t) if eat("]")
+    if eat(":")
+      b = pipe
+      expect("]")
+      return node("Slice", t, -1, b)
+    end
+    i = pipe
+    if eat(":")
+      return node("Slice", t, i) if eat("]")
+      b = pipe
+      expect("]")
+      return node("Slice", t, i, b)
+    end
+    expect("]")
+    node("Index", t, i)
+  end
+
+  def postfix : Int32
+    t = primary
+    loop do
+      c = peek
+      if c == 91
+        @fs.advance(1)
+        t = bracket(t)
+      elsif c == 46 && peek2 == 91
+        @fs.advance(2)
+        t = bracket(t)
+      elsif c == 46 && (id0(peek2) || peek2 == 34)
+        @fs.advance(1)
+        t = pfield(t)
+      elsif c == 63
+        fail("'?' is not supported")
+      else
+        break
+      end
+    end
+    t
+  end
+
+  def pfield(t : Int32) : Int32
+    if peek == 34
+      node("Field", t, text: string.copy_to(Program.tape))
+    else
+      node("Field", t, text: ident)
+    end
+  end
+
+  def argument_link(value : Int32, previous : Int32) : Int32
+    @arglinks << {value, previous}
+    @arglinks.size - 1
+  end
+
+  def save_arguments(head : Int32) : Int32
+    args = Array(Int32).new
+    i = head
+    while i >= 0
+      value, i = @arglinks[i]
+      args << value
+    end
+    run = @arguments.alloc_slice(args.size)
+    args.size.times { |j| run[j] = args[args.size - j - 1] }
+    @arglists << run
+    @arglists.size - 1
+  end
+
+  def arguments : Int32
+    head = -1
+    if eat("(")
+      loop do
+        value = pipe
+        head = argument_link(value, head)
+        next if eat(";")
+        expect(")")
+        break
+      end
+    end
+    save_arguments(head)
+  end
+
+  def object : Int32
+    head = -1
+    unless eat("}")
+      loop do
+        k, v = entry
+        head = argument_link(k, head)
+        head = argument_link(v, head)
+        next if eat(",")
+        expect("}")
+        break
+      end
+    end
+    list = save_arguments(head)
+    node("ObjCons", args: @arglists[list])
+  end
+
+  def objval : Int32
+    v = alt
+    while peek == 124 && peek2 != 61
+      @fs.advance(1)
+      v = node("Pipe", v, alt)
+    end
+    v
+  end
+
+  def entry : {Int32, Int32}
+    c = peek
+    if c == 34
+      # The parser lives as long as the program, so its strings do too.
+      name = string.copy_to(Program.tape)
+      k = node("LitStr", text: name)
+      return {k, eat(":") ? objval : node("Field", 0, text: name)}
+    end
+    if c == 40
+      @fs.advance(1)
+      k = pipe
+      expect(")")
+      expect(":")
+      return {k, objval}
+    end
+    if c == 36
+      name = variable
+      id = lookup(name, 0, 0)
+      fail("unknown variable") if id < 0
+      return {node("LitStr", text: name), node("Var", id: id)}
+    end
+    name = ident
+    k = node("LitStr", text: name)
+    {k, eat(":") ? objval : node("Field", 0, text: name)}
+  end
+
+  def primary : Int32
+    c = peek
+    if c == 46
+      @fs.advance(1)
+      if @fs.offset < @fs.string.bytesize && \
+            @fs.string[@fs.offset].to_u8 == 46
+        @fs.advance(1)
+        return node("Recurse")
+      end
+      if @fs.offset < @fs.string.bytesize && \
+            (id0(@fs.string[@fs.offset].to_u8) || \
+              @fs.string[@fs.offset].to_u8 == 34)
+        return pfield(0)
+      end
+      return 0
+    end
+    if c >= 48 && c <= 57
+      start = @fs.offset
+      while @fs.offset < @fs.string.bytesize
+        b = @fs.string[@fs.offset].to_u8
+        break unless idchar(b) || b == 46 ||
+                     ((b == 43 || b == 45) && (@fs.string[@fs.offset - \
+                       1].to_u8 == 101 ||
+                     @fs.string[@fs.offset - \
+                       1].to_u8 == 69))
+        @fs.advance(1)
+      end
+      return node("Lit", value: Cell.num(parse_float(@fs.string[start, @fs.offset - \
+        start].as_tape)))
+    end
+    return node("LitStr", text: string.copy_to(Program.tape)) if c == 34
+    if c == 36
+      id = lookup(variable, 0, 0)
+      fail("unknown variable") if id < 0
+      return node("Var", id: id)
+    end
+    if eat("(")
+      e = pipe
+      expect(")")
+      return e
+    end
+    if eat("[")
+      return node("Collect", node("Builtin", text: "empty")) if eat("]")
+      e = pipe
+      expect("]")
+      return node("Collect", e)
+    end
+    return object if eat("{")
+    if kw("if")
+      cnd = pipe
+      fail("'then' expected") unless kw("then")
+      t = pipe
+      return if_rest(cnd, t)
+    end
+    reduce = kw("reduce")
+    if reduce || kw("foreach")
+      s = postfix
+      fail("'as' expected") unless kw("as")
+      sm = @scope.size
+      id = bind(variable_pos)
+      expect("(")
+      init = pipe
+      expect(";")
+      upd = pipe
+      ext = !reduce && eat(";") ? pipe : -1
+      expect(")")
+      unscope(sm)
+      kind = (reduce ? "Reduce" : "Foreach")
+      return node(kind, s, init, upd, ext, id: id)
+    end
+    return node("Lit") if kw("null")
+    return node("Lit", value: Cell.new(2)) if kw("true")
+    return node("Lit", value: Cell.new(1)) if kw("false")
+    name = ident
+    list = arguments
+    args = @arglists[list]
+    if name == "map" && args.size == 1
+      return node("Collect", node("Pipe", node("Iter", 0), args[0]))
+    end
+    fid = lookup(name, 1, args.size)
+    return node("Call", id: fid, args: args) if fid >= 0
+    arity = case name
+            when "length", "not", "empty", "reverse", "sort", "min", "max", "add",
+                 "tostring", "tojson", "fromjson", "type", "strings", "numbers",
+                 "arrays", "objects", "recurse", "ceil", "floor", "keys"
+              0
+            when "join", "last", "first", "group_by", "select"
+              1
+            else
+              -1
+            end
+    valid = name == "range" ? (args.size >= 1 && args.size <= 3) : arity == args.size
+    fail("unknown function #{name}/#{args.size}") unless valid
+    node("Builtin", text: name, args: args)
+  end
+
+  def if_rest(cnd : Int32, t : Int32) : Int32
+    if kw("elif")
+      c2 = pipe
+      fail("'then' expected") unless kw("then")
+      t2 = pipe
+      return node("If", cnd, t, if_rest(c2, t2))
+    end
+    if kw("else")
+      e = pipe
+      fail("'end' expected") unless kw("end")
+      return node("If", cnd, t, e)
+    end
+    fail("'end' expected") unless kw("end")
+    node("If", cnd, t, 0)
+  end
+end
+
+struct Entry
+  getter cell : Cell
+  getter start : Int32
+  getter length : Int32
+
+  def initialize(@cell : Cell, @start : Int32, @length : Int32)
+  end
+end
+
+struct Pair
+  getter key : Cell
+  getter value : Cell
+
+  def initialize(@key : Cell, @value : Cell)
+  end
+end
+
+struct Span
+  getter at : Int32
+  getter nk : Int32
+  getter nv : Int32
+
+  def initialize(@at : Int32, @nk : Int32, @nv : Int32)
+  end
+end
+
+# True when no byte of w is below 32, a quote, a backslash or 127.
+def plain8(w : UInt64) : Bool
+  ones = 0x0101010101010101_u64
+  q = w ^ (ones &* 34)
+  b = w ^ (ones &* 92)
+  d = w ^ (ones &* 127)
+  bad = ((w &- ones &* 32) & ~w) | ((q &- ones) & ~q) | ((b &- ones) & ~b) | \
+    ((d &- ones) & ~d)
+  (bad & 0x8080808080808080_u64) == 0
+end
+
+@[OnTape]
+struct Engine
+  def initialize(@nodes : Array(Node), @defs : Array(Definition), size : Int32)
+    cells = size // 4 > 64 ? size // 4 : 64
+    entries = size // 16 > 64 ? size // 16 : 64
+    frames = @nodes.size > 64 ? @nodes.size : 64
+    @pool = Array(UInt8).new(size * 2)
+    @outs = Array(Cell).new(cells)
+    @entries = Array(Entry).new(entries)
+    @keys = String::Builder.new(size > 1024 ? size : 1024)
+    @sb = String::Builder.new(size > 1024 ? size : 1024)
+    @tb = String::Builder.new(size > 1024 ? size : 1024)
+    @ob = String::Builder.new(size)
+    @pairs = Array(Pair).new(entries)
+    @merge = Array(Pair).new(entries)
+    @spans = Array(Span).new(frames)
+    @envid = Array(Int32).new(frames)
+    @envval = Array(Cell).new(frames)
+    @seen = Array(Int32).new(64)
+    @lb = String::Builder.new(size)
+    @jb = String::Builder.new(1024)
+    @sc = String::Scanner.new
+  end
+
+  # Reset scratch storage, retaining room for reuse. Writers can reserve from
+  # the input's size; arrays retain their initial room and any later growth.
+  def reset(text : String) : Nil
+    @pool.clear
+    @outs.clear
+    @entries.clear
+    @keys.clear
+    @sb.clear
+    @tb.clear
+    @ob.clear
+    @pairs.clear
+    @merge.clear
+    @spans.clear
+    @envid.clear
+    @envval.clear
+    size = text.bytesize
+    @keys.reserve(size)
+    @sb.reserve(size)
+    @tb.reserve(size)
+    @ob.reserve(size)
+    @sc = String::Scanner.new
+    @jb.clear
+    @lb.clear
+    @lb << text
+    @sc = String::Scanner.new(@lb.finish)
+    nil
+  end
+
+  def trim(mark : Int32) : Nil
+    while @outs.size > mark
+      @outs.pop
+    end
+  end
+
+  def trim_entries(mark : Int32) : Nil
+    while @entries.size > mark
+      @entries.pop
+    end
+  end
+
+  def trim_pairs(mark : Int32) : Nil
+    while @pairs.size > mark
+      @pairs.pop
+    end
+  end
+
+  def putlen(n : Int32) : Nil
+    v = n
+    loop do
+      @pool.push(((v & 127) | (v >= 128 ? 128 : 0)).to_u8)
+      v >>= 7
+      break if v == 0
+    end
+  end
+
+  def span(at : Int32) : {Int32, Int32}
+    n = 0
+    shift = 0
+    s = @pool.bytes
+    loop do
+      c = s[at]
+      at += 1
+      n |= (c & 127).to_i32 << shift
+      break if c < 128
+      shift += 7
+    end
+    {at, n}
+  end
+
+  def putcell(c : Cell) : Nil
+    @pool.push(c.tag.to_u8)
+    @pool.write_bytes(c.bits)
+  end
+
+  def cell(at : Int32) : Cell
+    Cell.new(@pool.bytes[at].to_i32, @pool.read_bytes_at(UInt64, at + 1))
+  end
+
+  def kind(c : Cell) : Int32
+    c.tag == 4 ? @pool.bytes[c.bits.to_i32].to_i32 : c.tag
+  end
+
+  def new_str(s : String) : Cell
+    at = @pool.size
+    @pool.push(4_u8)
+    putlen(s.bytesize)
+    @pool.append(s)
+    Cell.new(4, at.to_u64)
+  end
+
+  # A string copied from pool bytes s...s + n; indexes survive growth.
+  def pool_str(s : Int32, n : Int32) : Cell
+    at = @pool.size
+    @pool.push(4_u8)
+    putlen(n)
+    n.times { |i| @pool.push(@pool[s + i]) }
+    Cell.new(4, at.to_u64)
+  end
+
+  def sval(c : Cell) : String
+    raise "string expected" unless kind(c) == 4
+    at, n = span(c.bits.to_i32 + 1)
+    @pool.bytes[at, n]
+  end
+
+  def items(c : Cell) : {Int32, Int32}
+    raise "array expected" unless kind(c) == 5
+    span(c.bits.to_i32 + 1)
+  end
+
+  def new_arr(mark : Int32) : Cell
+    at = @pool.size
+    @pool.push(5_u8)
+    putlen(@outs.size - mark)
+    i = mark
+    while i < @outs.size
+      putcell(@outs[i])
+      i += 1
+    end
+    Cell.new(4, at.to_u64)
+  end
+
+  def key_of(e : Entry) : String
+    @keys.finish[e.start, e.length]
+  end
+
+  def push_key(s : String, c : Cell) : Nil
+    at = @keys.length
+    @keys.append(s)
+    @entries << Entry.new(c, at, s.bytesize)
+  end
+
+  def new_obj(mark : Int32, km : Int32) : Cell
+    # Preserve first-key order, replacing each duplicate's value.
+    # Large objects use a hash of byte spans, checking collisions by bytes.
+    slots = 16
+    while slots < (@entries.size - mark) * 2
+      slots *= 2
+    end
+    # One reused table: a fresh Array per object costs a reservation.
+    if @entries.size - mark > 8
+      while @seen.size < slots
+        @seen << -1
+      end
+      slots.times { |k| @seen[k] = -1 }
+    end
+    w = mark
+    e = @entries.size
+    i = mark
+    while i < e
+      ent = @entries[i]
+      found = -1
+      if e - mark <= 8
+        j = mark
+        while j < w
+          if key_of(@entries[j]) == key_of(ent)
+            found = j
+            break
+          end
+          j += 1
+        end
+      else
+        h = 14695981039346656037_u64
+        key_of(ent).each_byte { |b| h = (h ^ b.to_u64) &* 1099511628211_u64 }
+        slot = (h & (slots - 1).to_u64).to_i32
+        loop do
+          j = @seen[slot]
+          break if j < 0
+          if key_of(@entries[j]) == key_of(ent)
+            found = j
+            break
+          end
+          slot = (slot + 1) & (slots - 1)
+        end
+        @seen[slot] = w if found < 0
+      end
+      if found >= 0
+        old = @entries[found]
+        @entries[found] = Entry.new(ent.cell, old.start, old.length)
+      else
+        @entries[w] = ent
+        w += 1
+      end
+      i += 1
+    end
+    at = @pool.size
+    @pool.push(6_u8)
+    putlen(w - mark)
+    i = mark
+    while i < w
+      ent = @entries[i]
+      putlen(ent.length)
+      @pool.append(key_of(ent))
+      putcell(ent.cell)
+      i += 1
+    end
+    trim_entries(mark)
+    Cell.new(4, at.to_u64)
+  end
+
+  def push_ents(c : Cell) : Nil
+    raise "object expected" unless kind(c) == 6
+    at, n = span(c.bits.to_i32 + 1)
+    n.times do
+      s, len = span(at)
+      push_key(@pool.bytes[s, len], cell(s + len))
+      at = s + len + 9
+    end
+  end
+
+  def cmp(a : Cell, b : Cell) : Int32
+    ka = kind(a)
+    kb = kind(b)
+    return ka < kb ? -1 : 1 if ka != kb
+    if ka == 3
+      x = a.number
+      y = b.number
+      return x < y ? -1 : (x > y ? 1 : 0)
+    end
+    return cmpstr(sval(a), sval(b)) if ka == 4
+    if ka == 5
+      sa, na = items(a)
+      sb, nb = items(b)
+      i = 0
+      while i < na && i < nb
+        c = cmp(cell(sa + i * 9), cell(sb + i * 9))
+        return c if c != 0
+        i += 1
+      end
+      return na < nb ? -1 : (na > nb ? 1 : 0)
+    end
+    if ka == 6
+      sa, na = span(a.bits.to_i32 + 1)
+      sb, nb = span(b.bits.to_i32 + 1)
+      return na < nb ? -1 : 1 if na != nb
+      na.times do
+        k, len = span(sa)
+        key = @pool.bytes[k, len]
+        at = sb
+        hit = false
+        nb.times do
+          j, ln = span(at)
+          if key == @pool.bytes[j, ln]
+            hit = true
+            c = cmp(cell(k + len), cell(j + ln))
+            return c if c != 0
+            break
+          end
+          at = j + ln + 9
+        end
+        raise "ordering of objects with different keys is not supported" \
+               unless hit
+        sa = k + len + 9
+      end
+    end
+    0
+  end
+
+  def ws : Nil
+    while @sc.offset < @sc.string.bytesize
+      c = @sc.string[@sc.offset]
+      break unless c == 32 || c == 10 || c == 9 || c == 13
+      @sc.advance
+    end
+  end
+
+  def expect(c : UInt8) : Nil
+    raise "unexpected JSON delimiter" unless @sc.offset < \
+                                               @sc.string.bytesize && @sc.string[@sc.offset] == c
+    @sc.advance
+  end
+
+  def utf8_len(i : Int32) : Int32
+    c = @sc.string[i]
+    n = 0
+    lo = 0x80
+    hi = 0xBF
+    if c >= 0xC2 && c <= 0xDF
+      n = 2
+    elsif c >= 0xE0 && c <= 0xEF
+      n = 3
+      lo = 0xA0 if c == 0xE0
+      hi = 0x9F if c == 0xED
+    elsif c >= 0xF0 && c <= 0xF4
+      n = 4
+      lo = 0x90 if c == 0xF0
+      hi = 0x8F if c == 0xF4
+    else
+      raise "invalid UTF-8 in input"
+    end
+    raise "invalid UTF-8 in input" if i + n > @sc.string.bytesize
+    c1 = @sc.string[i + 1]
+    raise "invalid UTF-8 in input" unless c1 >= lo && c1 <= hi
+    k = 2
+    while k < n
+      ck = @sc.string[i + k]
+      raise "invalid UTF-8 in input" unless ck >= 0x80 && ck <= 0xBF
+      k += 1
+    end
+    n
+  end
+
+  def hex4 : Int32
+    raise "short Unicode escape" if @sc.offset + 4 > @sc.string.bytesize
+    v = 0
+    4.times do
+      c = @sc.string[@sc.offset]
+      d = if c >= 48 && c <= 57
+            c.to_i32 - 48
+          elsif c >= 97 && c <= 102
+            c.to_i32 - 87
+          elsif c >= 65 && c <= 70
+            c.to_i32 - 55
+          else
+            raise "bad Unicode escape"
+          end
+      v = v * 16 + d
+      @sc.advance
+    end
+    v
+  end
+
+  def push_cp(cp : Int32) : Nil
+    if cp < 0x80
+      @sb.push(cp.to_u8)
+    elsif cp < 0x800
+      @sb.push((0xC0 | (cp >> 6)).to_u8)
+      @sb.push((0x80 | (cp & 63)).to_u8)
+    elsif cp < 0x10000
+      @sb.push((0xE0 | (cp >> 12)).to_u8)
+      @sb.push((0x80 | ((cp >> 6) & 63)).to_u8)
+      @sb.push((0x80 | (cp & 63)).to_u8)
+    else
+      @sb.push((0xF0 | (cp >> 18)).to_u8)
+      @sb.push((0x80 | ((cp >> 12) & 63)).to_u8)
+      @sb.push((0x80 | ((cp >> 6) & 63)).to_u8)
+      @sb.push((0x80 | (cp & 63)).to_u8)
+    end
+  end
+
+  # The unescaped fast path borrows bytes; escaped strings reuse one writer.
+  def scan_string : String
+    # The plain run walks a local index; the scanner moves once.
+    text = @sc.string
+    start = @sc.offset
+    p = start
+    while p < text.bytesize
+      c = text[p]
+      if c == 34
+        @sc.advance(p + 1 - start)
+        return text[start, p - start]
+      end
+      break if c == 92
+      p += c >= 0x80 ? utf8_len(p) : 1
+    end
+    @sc.advance(p - start)
+    mark = @sb.length
+    @sb.append(@sc.string[start, @sc.offset - start])
+    loop do
+      raise "unterminated string" if @sc.offset >= @sc.string.bytesize
+      c = @sc.string[@sc.offset]
+      @sc.advance
+      return @sb.finish[mark, @sb.length - mark] if c == 34
+      if c >= 0x80
+        k = utf8_len(@sc.offset - 1)
+        @sb.append(@sc.string[@sc.offset - 1, k])
+        @sc.advance(k - 1)
+        next
+      end
+      if c != 92
+        @sb.push(c)
+        next
+      end
+      raise "unterminated string" if @sc.offset >= @sc.string.bytesize
+      e = @sc.string[@sc.offset]
+      @sc.advance
+      case e
+      when 110 then @sb.push(10_u8)
+      when 116 then @sb.push(9_u8)
+      when 114 then @sb.push(13_u8)
+      when  98 then @sb.push(8_u8)
+      when 102 then @sb.push(12_u8)
+      when 117
+        cp = hex4
+        if cp >= 0xD800 && cp < 0xDC00 && @sc.offset + 1 < \
+             @sc.string.bytesize &&
+             @sc.string[@sc.offset] == 92 && @sc.string[@sc.offset + 1] == 117
+          @sc.advance(2)
+          lo = hex4
+          if lo >= 0xDC00 && lo < 0xE000
+            cp = 0x10000 + ((cp - 0xD800) << 10) + lo - 0xDC00
+          else
+            push_cp(0xFFFD)
+            cp = lo
+          end
+        end
+        cp = 0xFFFD if cp >= 0xD800 && cp < 0xE000
+        push_cp(cp)
+      else
+        @sb.push(e)
+      end
+    end
+  end
+
+  def parse_value : Cell
+    ws
+    raise "unexpected end of JSON" if @sc.offset >= @sc.string.bytesize
+    c = @sc.string[@sc.offset]
+    if c == 123
+      @sc.advance
+      m = @entries.size
+      km = @keys.length
+      ws
+      if @sc.offset < @sc.string.bytesize && @sc.string[@sc.offset] == 125
+        @sc.advance
+        return new_obj(m, km)
+      end
+      loop do
+        ws
+        expect(34_u8)
+        key = scan_string
+        ka = @keys.length
+        @keys.append(key)
+        kl = key.bytesize
+        ws
+        expect(58_u8)
+        v = parse_value
+        @entries << Entry.new(v, ka, kl)
+        ws
+        raise "unterminated object" if @sc.offset >= @sc.string.bytesize
+        if @sc.string[@sc.offset] == 44
+          @sc.advance
+          next
+        end
+        expect(125_u8)
+        break
+      end
+      return new_obj(m, km)
+    end
+    if c == 91
+      @sc.advance
+      m = @outs.size
+      ws
+      if @sc.offset < @sc.string.bytesize && @sc.string[@sc.offset] == 93
+        @sc.advance
+        return new_arr(m)
+      end
+      loop do
+        v = parse_value
+        @outs << v
+        ws
+        raise "unterminated array" if @sc.offset >= @sc.string.bytesize
+        if @sc.string[@sc.offset] == 44
+          @sc.advance
+          next
+        end
+        expect(93_u8)
+        break
+      end
+      r = new_arr(m)
+      trim(m)
+      return r
+    end
+    if c == 34
+      @sc.advance
+      return new_str(scan_string)
+    end
+    if c == 116
+      @sc.advance(4)
+      return Cell.new(2)
+    end
+    if c == 102
+      @sc.advance(5)
+      return Cell.new(1)
+    end
+    if c == 110
+      @sc.advance(4)
+      return Cell.new
+    end
+    start = @sc.offset
+    neg = c == 45
+    @sc.advance if neg
+    v = 0_i64
+    digits = 0
+    while @sc.offset < @sc.string.bytesize && @sc.string[@sc.offset] >= 48 && @sc.string[@sc.offset] <= 57
+      v = v &* 10 &+ (@sc.string[@sc.offset] - 48).to_i64
+      @sc.advance
+      digits += 1
+    end
+    simple = digits > 0 && digits <= 15
+    while @sc.offset < @sc.string.bytesize
+      c = @sc.string[@sc.offset]
+      break unless (c >= 48 && c <= 57) || c == 46 || c == 101 ||
+                   c == 69 || c == 43 || c == 45
+      simple = false
+      @sc.advance
+    end
+    return Cell.num(neg ? -v.to_f64 : v.to_f64) if simple
+    Cell.num(parse_float(@sc.string[start, @sc.offset - start]))
+  end
+
+  def emit_str(dest : String::Builder, s : String) : Nil
+    dest.push(34_u8)
+    run = 0
+    i = 0
+    while i < s.bytesize
+      if i + 8 <= s.bytesize && plain8(s.read_bytes_at(UInt64, i))
+        i += 8
+        next
+      end
+      c = s[i]
+      if c < 32 || c == 34 || c == 92 || c == 127
+        dest.append(s[run, i - run])
+        run = i + 1
+        case c
+        when 34 then dest.append("\\\"")
+        when 92 then dest.append("\\\\")
+        when 10 then dest.append("\\n")
+        when  9 then dest.append("\\t")
+        when 13 then dest.append("\\r")
+        when  8 then dest.append("\\b")
+        when 12 then dest.append("\\f")
+        else
+          dest.append("\\u00")
+          hex = "0123456789abcdef".as_tape
+          dest.push(hex[(c >> 4).to_i32])
+          dest.push(hex[(c & 15).to_i32])
+        end
+      end
+      i += 1
+    end
+    dest.append(s[run, s.bytesize - run])
+    dest.push(34_u8)
+  end
+
+  def emit_num(dest : String::Builder, v : Float64) : Nil
+    if v == v.floor && v < 1e17 && v > -1e17
+      if v == 0 && 1.0 / v < 0
+        dest.append("-0")
+      else
+        dest.append_int(v.to_i64)
+      end
+    elsif v.nan?
+      dest.append("null")
+    elsif v.infinite?
+      dest.append(v > 0 ? "1.7976931348623157e+308" : "-1.7976931348623157e+308")
+    else
+      emit_float(dest, v)
+    end
+  end
+
+  def emit_float(dest : String::Builder, f : Float64) : Nil
+    text = ""
+    text << f
+    digit_text = String::Builder.new(32)
+    if text == "NaN" || text == "Infinity" || text == "-Infinity"
+      dest.append(text == "NaN" ? "nan" : (text == "Infinity" ? "inf" : "-inf"))
+      return
+    end
+    i = 0
+    if text[0] == 45
+      dest.push(45_u8)
+      i += 1
+    end
+    point = 0
+    dot = false
+    while i < text.bytesize && text[i] != 101
+      if text[i] == 46
+        dot = true
+      else
+        digit_text.push(text[i])
+        point += 1 unless dot
+      end
+      i += 1
+    end
+    if i < text.bytesize
+      point += text[i + 1, text.bytesize - i - 1].to_i
+    end
+    digits = digit_text.finish
+    start = 0
+    while start < digits.bytesize - 1 && digits[start] == 48
+      start += 1
+      point -= 1
+    end
+    stop = digits.bytesize
+    while stop > start + 1 && digits[stop - 1] == 48
+      stop -= 1
+    end
+    digits = digits[start, stop - start]
+    if digits.bytesize == 1 && digits[0] == 48
+      dest.append("0.0")
+      return
+    end
+    x = point - 1
+    n = digits.bytesize
+    if x < -4 || x >= (n > 15 ? n : 15)
+      dest.push(digits[0])
+      if n > 1
+        dest.push(46_u8)
+        dest.append(digits[1, n - 1])
+      end
+      dest.push(101_u8)
+      dest.push(x < 0 ? 45_u8 : 43_u8)
+      e = x < 0 ? -x : x
+      dest.push(48_u8) if e < 10
+      dest << e
+    elsif x < 0
+      dest.append("0.")
+      (-point).times { dest.push(48_u8) }
+      dest.append(digits)
+    else
+      i = 0
+      while i < n || i < point
+        dest.push(46_u8) if i == point
+        dest.push(i < n ? digits[i] : 48_u8)
+        i += 1
+      end
+      dest.append(".0") if n <= point
+    end
+  end
+
+  def emit(dest : String::Builder, c : Cell) : Nil
+    case kind(c)
+    when 0 then dest.append("null")
+    when 1 then dest.append("false")
+    when 2 then dest.append("true")
+    when 3 then emit_num(dest, c.number)
+    when 4 then emit_str(dest, sval(c))
+    when 5
+      at, n = items(c)
+      dest.push(91_u8)
+      n.times do |i|
+        dest.push(44_u8) if i > 0
+        emit(dest, cell(at + i * 9))
+      end
+      dest.push(93_u8)
+    when 6
+      at, n = span(c.bits.to_i32 + 1)
+      dest.push(123_u8)
+      n.times do |i|
+        dest.push(44_u8) if i > 0
+        s, len = span(at)
+        emit_str(dest, @pool.bytes[s, len])
+        dest.push(58_u8)
+        emit(dest, cell(s + len))
+        at = s + len + 9
+      end
+      dest.push(125_u8)
+    end
+  end
+
+  def cmpstr(a : String, b : String) : Int32
+    i = 0
+    while i < a.bytesize && i < b.bytesize
+      return a[i] < b[i] ? -1 : 1 if a[i] != b[i]
+      i += 1
+    end
+    a.bytesize < b.bytesize ? -1 : (a.bytesize > b.bytesize ? 1 : 0)
+  end
+
+  def collapse(mark : Int32, from : Int32) : Nil
+    return if from == mark
+    k = mark
+    i = from
+    while i < @outs.size
+      @outs[k] = @outs[i]
+      k += 1
+      i += 1
+    end
+    trim(k)
+  end
+
+  def field(t : Cell, key : String) : Cell
+    return Cell.new if kind(t) == 0
+    raise "cannot index this value" unless kind(t) == 6
+    at, n = span(t.bits.to_i32 + 1)
+    n.times do
+      s, len = span(at)
+      return cell(s + len) if @pool.bytes[s, len] == key
+      at = s + len + 9
+    end
+    Cell.new
+  end
+
+  def index_cell(t : Cell, i : Cell) : Cell
+    kt = kind(t)
+    return Cell.new if kt == 0
+    return field(t, sval(i)) if kt == 6
+    if kt == 5
+      at, n = items(t)
+      j = i.number.floor.to_i64
+      j += n if j < 0
+      return Cell.new if j < 0 || j >= n
+      return cell(at + j.to_i32 * 9)
+    end
+    raise "cannot index this value"
+  end
+
+  def clamp(v : Int64, n : Int32) : Int32
+    v = v < 0 ? v + n : v
+    return 0 if v < 0
+    return n if v > n
+    v.to_i32
+  end
+
+  def slice_cell(t : Cell, a : Cell, hasa : Bool, b : Cell, hasb : Bool) : Cell
+    kt = kind(t)
+    return Cell.new if kt == 0
+    raise "cannot slice" unless kt == 4 || kt == 5
+    at = 0
+    n = 0
+    if kt == 4
+      n = sval(t).bytesize
+    else
+      at, n = items(t)
+    end
+    lo = hasa && kind(a) == 3 ? clamp(a.number.floor.to_i64, n) : 0
+    hi = hasb && kind(b) == 3 ? clamp(b.number.ceil.to_i64, n) : n
+    hi = lo if hi < lo
+    if kt == 4
+      at, n = span(t.bits.to_i32 + 1)
+      return pool_str(at + lo, hi - lo)
+    end
+    m = @outs.size
+    i = lo
+    while i < hi
+      @outs << cell(at + i * 9)
+      i += 1
+    end
+    r = new_arr(m)
+    trim(m)
+    r
+  end
+
+  def length_of(c : Cell) : Cell
+    case kind(c)
+    when 0 then Cell.num(0)
+    when 3 then Cell.num(c.number.abs)
+    when 4
+      n = 0
+      sval(c).each_byte { |b| n += 1 if (b & 0xC0) != 0x80 }
+      Cell.num(n)
+    when 5, 6
+      at, n = span(c.bits.to_i32 + 1)
+      Cell.num(n)
+    else
+      raise "boolean has no length"
+    end
+  end
+
+  def type_name(c : Cell) : String
+    case kind(c)
+    when 0    then "null"
+    when 1, 2 then "boolean"
+    when 3    then "number"
+    when 4    then "string"
+    when 5    then "array"
+    else           "object"
+    end
+  end
+
+  def concat_str(a : Cell, b : Cell) : Cell
+    m = @tb.length
+    @tb.append(sval(a))
+    @tb.append(sval(b))
+    r = new_str(@tb.finish[m, @tb.length - m])
+    r
+  end
+
+  def arith(op : String, a : Cell, b : Cell) : Cell
+    ka = kind(a)
+    kb = kind(b)
+    if op == "+"
+      return b if ka == 0
+      return a if kb == 0
+      return Cell.num(a.number + b.number) if ka == 3 && kb == 3
+      return concat_str(a, b) if ka == 4 && kb == 4
+      if ka == 5 && kb == 5
+        m = @outs.size
+        append_items(a)
+        append_items(b)
+        r = new_arr(m)
+        trim(m)
+        return r
+      end
+      if ka == 6 && kb == 6
+        m = @entries.size
+        km = @keys.length
+        push_ents(a)
+        push_ents(b)
+        return new_obj(m, km)
+      end
+      raise "cannot add these types"
+    end
+    if op == "*" && ka == 4 && kb == 3
+      n = b.number
+      return Cell.new if n <= 0
+      m = @tb.length
+      s = sval(a)
+      k = n.ceil.to_i64
+      i = 0_i64
+      while i < k
+        @tb.append(s)
+        i += 1
+      end
+      r = new_str(@tb.finish[m, @tb.length - m])
+      return r
+    end
+    raise "cannot apply operator to these types" unless ka == 3 && kb == 3
+    x = a.number
+    y = b.number
+    case op
+    when "-" then Cell.num(x - y)
+    when "*" then Cell.num(x * y)
+    when "/"
+      raise "division by zero" if y == 0
+      Cell.num(x / y)
+    when "%"
+      xi = x.to_i64
+      yi = y.to_i64
+      raise "modulo by zero" if yi == 0
+      q = xi // yi
+      Cell.num(xi - q * yi)
+    else
+      raise "bad operator"
+    end
+  end
+
+  def compare_op(op : String, a : Cell, b : Cell) : Cell
+    c = cmp(a, b)
+    v = case op
+        when "e" then c == 0
+        when "n" then c != 0
+        when "<" then c < 0
+        when "l" then c <= 0
+        when ">" then c > 0
+        when "g" then c >= 0
+        else          false
+        end
+    Cell.bool(v)
+  end
+
+  def append_items(c : Cell) : Nil
+    at, n = items(c)
+    n.times { |i| @outs << cell(at + i * 9) }
+  end
+
+  def tojson_cell(c : Cell) : Cell
+    m = @tb.length
+    emit(@tb, c)
+    r = new_str(@tb.finish[m, @tb.length - m])
+    r
+  end
+
+  def fromjson_cell(c : Cell) : Cell
+    saved = @sc
+    # A copy, so the scanner never views the pool that parsing grows;
+    # the copies stay until the next reset.
+    m = @jb.length
+    @jb << sval(c)
+    @sc = String::Scanner.new(@jb.finish[m, @jb.length - m])
+    v = parse_value
+    ws
+    raise "fromjson: trailing text" if @sc.offset != @sc.string.bytesize
+    @sc = saved
+    v
+  end
+
+  def join_cell(c : Cell, sep : Cell) : Cell
+    s = sval(sep)
+    m = @tb.length
+    at, n = items(c)
+    n.times do |i|
+      @tb.append(s) if i > 0
+      x = cell(at + i * 9)
+      case kind(x)
+      when 0
+      when 4 then @tb.append(sval(x))
+      when 3 then emit_num(@tb, x.number)
+      when 1 then @tb.append("false")
+      when 2 then @tb.append("true")
+      else        raise "join: cannot join arrays or objects"
+      end
+    end
+    r = new_str(@tb.finish[m, @tb.length - m])
+    r
+  end
+
+  def reverse_cell(c : Cell) : Cell
+    return new_arr(@outs.size) if kind(c) == 0
+    if kind(c) == 4
+      m = @tb.length
+      s = sval(c)
+      i = s.bytesize
+      while i > 0
+        j = i - 1
+        while j > 0 && (s[j] & 0xC0) == 0x80
+          j -= 1
+        end
+        @tb.append(s[j, i - j])
+        i = j
+      end
+      r = new_str(@tb.finish[m, @tb.length - m])
+      return r
+    end
+    m = @outs.size
+    at, n = items(c)
+    i = n
+    while i > 0
+      i -= 1
+      @outs << cell(at + i * 9)
+    end
+    r = new_arr(m)
+    trim(m)
+    r
+  end
+
+  # Bottom-up stable merge sort. Scratch storage is refilled, never reallocated
+  # per call; both sort and group_by use it, preserving equal-key input order.
+  def sort_pairs(mark : Int32) : Nil
+    n = @pairs.size - mark
+    @merge.clear
+    n.times { @merge << Pair.new(Cell.new, Cell.new) }
+    width = 1
+    while width < n
+      lo = 0
+      while lo < n
+        mid = lo + width
+        mid = n if mid > n
+        hi = lo + width * 2
+        hi = n if hi > n
+        i = lo
+        j = mid
+        k = lo
+        while k < hi
+          if i < mid && (j >= hi || cmp(@pairs[mark + i].key, @pairs[mark + \
+               j].key) <= 0)
+            @merge[k] = @pairs[mark + i]
+            i += 1
+          else
+            @merge[k] = @pairs[mark + j]
+            j += 1
+          end
+          k += 1
+        end
+        lo = hi
+      end
+      n.times { |i| @pairs[mark + i] = @merge[i] }
+      width *= 2
+    end
+  end
+
+  def sort_cell(c : Cell) : Cell
+    pm = @pairs.size
+    at, n = items(c)
+    n.times do |i|
+      x = cell(at + i * 9)
+      @pairs << Pair.new(x, x)
+    end
+    sort_pairs(pm)
+    m = @outs.size
+    i = pm
+    while i < @pairs.size
+      @outs << @pairs[i].value
+      i += 1
+    end
+    trim_pairs(pm)
+    r = new_arr(m)
+    trim(m)
+    r
+  end
+
+  def minmax_cell(c : Cell, want_max : Bool) : Cell
+    at, n = items(c)
+    return Cell.new if n == 0
+    best = cell(at)
+    i = 1
+    while i < n
+      x = cell(at + i * 9)
+      k = cmp(x, best)
+      best = x if want_max ? k >= 0 : k < 0
+      i += 1
+    end
+    best
+  end
+
+  def add_cell(c : Cell) : Cell
+    at, n = items(c)
+    return Cell.new if n == 0
+    all_nums = true
+    n.times { |i| all_nums = false if kind(cell(at + i * 9)) != 3 }
+    if all_nums
+      total = 0.0
+      n.times { |i| total += cell(at + i * 9).number }
+      return Cell.num(total)
+    end
+    k0 = 0
+    n.times do |i|
+      k0 = kind(cell(at + i * 9))
+      break if k0 != 0
+    end
+    return Cell.new if k0 == 0
+    if k0 == 5
+      m = @outs.size
+      n.times do |i|
+        x = cell(at + i * 9)
+        if kind(x) == 5
+          append_items(x)
+        elsif kind(x) != 0
+          raise "cannot add"
+        end
+      end
+      r = new_arr(m)
+      trim(m)
+      return r
+    end
+    if k0 == 6
+      m = @entries.size
+      km = @keys.length
+      n.times do |i|
+        x = cell(at + i * 9)
+        if kind(x) == 6
+          push_ents(x)
+        elsif kind(x) != 0
+          raise "cannot add"
+        end
+      end
+      return new_obj(m, km)
+    end
+    if k0 == 4
+      m = @tb.length
+      n.times do |i|
+        x = cell(at + i * 9)
+        if kind(x) == 4
+          @tb.append(sval(x))
+        elsif kind(x) != 0
+          raise "cannot add"
+        end
+      end
+      r = new_str(@tb.finish[m, @tb.length - m])
+      return r
+    end
+    acc = Cell.new
+    n.times { |i| acc = arith("+", acc, cell(at + i * 9)) }
+    acc
+  end
+
+  def keys_cell(c : Cell) : Cell
+    raise "keys: object expected" unless kind(c) == 6
+    m = @outs.size
+    at, n = span(c.bits.to_i32 + 1)
+    n.times do
+      s, len = span(at)
+      @outs << pool_str(s, len)
+      at = s + len + 9
+    end
+    r = new_arr(m)
+    trim(m)
+    sort_cell(r)
+  end
+
+  def recurse_cell(c : Cell) : Nil
+    @outs << c
+    k = kind(c)
+    if k == 5
+      at, n = items(c)
+      n.times { |i| recurse_cell(cell(at + i * 9)) }
+    elsif k == 6
+      at, n = span(c.bits.to_i32 + 1)
+      n.times do
+        s, len = span(at)
+        recurse_cell(cell(s + len))
+        at = s + len + 9
+      end
+    end
+  end
+
+  def getvar(id : Int32) : Cell
+    i = @envid.size - 1
+    while i >= 0
+      return @envval[i] if @envid[i] == id
+      i -= 1
+    end
+    raise "unbound variable"
+  end
+
+  def unbind(n : Int32 = 1) : Nil
+    n.times do
+      @envid.pop
+      @envval.pop
+    end
+  end
+
+  def ev(index : Int32, x : Cell) : Nil
+    n = @nodes[index]
+    case n.kind
+    when "Ident"   then @outs << x
+    when "Recurse" then recurse_cell(x)
+    when "Lit"     then @outs << n.value
+    when "LitStr"  then @outs << new_str(n.text)
+    when "Field"   then ev_field(n, x)
+    when "Index"   then ev_index(n, x)
+    when "Slice"   then ev_slice(n, x)
+    when "Iter"    then ev_iter(n, x)
+    when "Pipe"    then ev_pipe(n, x)
+    when "Comma"
+      ev(n.a, x)
+      ev(n.b, x)
+    when "Neg"       then ev_neg(n, x)
+    when "Bin"       then ev_bin(n, x)
+    when "And", "Or" then ev_bool(n, x)
+    when "Alt"       then ev_alt(n, x)
+    when "Collect"   then ev_collect(n, x)
+    when "ObjCons"   then ev_object(n, x)
+    when "If"        then ev_if(n, x)
+    when "Reduce"    then ev_reduce(n, x)
+    when "Foreach"   then ev_foreach(n, x)
+    when "As"        then ev_as(n, x)
+    when "Var"       then @outs << getvar(n.id)
+    when "Call"      then ev_call(n, x)
+    when "Builtin"   then builtin(n, x)
+    else                  raise "unknown AST node"
+    end
+  end
+
+  # Separate evaluator frames mirror Goose's variant-specific case functions.
+  def ev_field(n : Node, x : Cell) : Nil
+    m = @outs.size
+    ev(n.a, x)
+    e = @outs.size
+    i = m
+    while i < e
+      @outs << field(@outs[i], n.text)
+      i += 1
+    end
+    collapse(m, e)
+  end
+
+  def ev_index(n : Node, x : Cell) : Nil
+    m = @outs.size
+    ev(n.b, x)
+    e1 = @outs.size
+    ev(n.a, x)
+    e2 = @outs.size
+    j = m
+    while j < e1
+      i = e1
+      while i < e2
+        @outs << index_cell(@outs[i], @outs[j])
+        i += 1
+      end
+      j += 1
+    end
+    collapse(m, e2)
+  end
+
+  def ev_slice(n : Node, x : Cell) : Nil
+    m = @outs.size
+    ev(n.a, x)
+    e1 = @outs.size
+    ca = Cell.new
+    cb = Cell.new
+    if n.b >= 0
+      ev(n.b, x)
+      ca = @outs[@outs.size - 1]
+    end
+    if n.c >= 0
+      ev(n.c, x)
+      cb = @outs[@outs.size - 1]
+    end
+    e2 = @outs.size
+    i = m
+    while i < e1
+      @outs << slice_cell(@outs[i], ca, n.b >= 0, cb, n.c >= 0)
+      i += 1
+    end
+    collapse(m, e2)
+  end
+
+  def ev_iter(n : Node, x : Cell) : Nil
+    m = @outs.size
+    ev(n.a, x)
+    e = @outs.size
+    i = m
+    while i < e
+      t = @outs[i]
+      k = kind(t)
+      if k == 5
+        append_items(t)
+      elsif k == 6
+        at, count = span(t.bits.to_i32 + 1)
+        count.times do
+          s, len = span(at)
+          @outs << cell(s + len)
+          at = s + len + 9
+        end
+      else
+        raise "cannot iterate over this value"
+      end
+      i += 1
+    end
+    collapse(m, e)
+  end
+
+  def ev_pipe(n : Node, x : Cell) : Nil
+    m = @outs.size
+    ev(n.a, x)
+    e = @outs.size
+    i = m
+    while i < e
+      ev(n.b, @outs[i])
+      i += 1
+    end
+    collapse(m, e)
+  end
+
+  def ev_neg(n : Node, x : Cell) : Nil
+    m = @outs.size
+    ev(n.a, x)
+    i = m
+    while i < @outs.size
+      @outs[i] = Cell.num(0.0 - @outs[i].number)
+      i += 1
+    end
+  end
+
+  def ev_bin(n : Node, x : Cell) : Nil
+    m = @outs.size
+    ev(n.b, x)
+    e1 = @outs.size
+    ev(n.a, x)
+    e2 = @outs.size
+    op = n.text
+    cmpop = op == "e" || op == "n" || op == "<" || op == ">" || op == "l" || \
+       op == "g"
+    j = m
+    while j < e1
+      i = e1
+      while i < e2
+        c = cmpop ? compare_op(op, @outs[i], @outs[j]) : arith(op, @outs[i],
+          @outs[j])
+        @outs << c
+        i += 1
+      end
+      j += 1
+    end
+    collapse(m, e2)
+  end
+
+  def ev_bool(n : Node, x : Cell) : Nil
+    m = @outs.size
+    ev(n.a, x)
+    e = @outs.size
+    i = m
+    want = n.kind == "Or"
+    while i < e
+      if @outs[i].truthy == want
+        @outs << Cell.bool(want)
+      else
+        r0 = @outs.size
+        ev(n.b, x)
+        j = r0
+        while j < @outs.size
+          @outs[j] = Cell.bool(@outs[j].truthy)
+          j += 1
+        end
+      end
+      i += 1
+    end
+    collapse(m, e)
+  end
+
+  def ev_alt(n : Node, x : Cell) : Nil
+    m = @outs.size
+    ev(n.a, x)
+    k = m
+    i = m
+    while i < @outs.size
+      if @outs[i].truthy
+        @outs[k] = @outs[i]
+        k += 1
+      end
+      i += 1
+    end
+    trim(k)
+    ev(n.b, x) if k == m
+  end
+
+  def ev_collect(n : Node, x : Cell) : Nil
+    m = @outs.size
+    ev(n.a, x)
+    r = new_arr(m)
+    trim(m)
+    @outs << r
+  end
+
+  def ev_object(n : Node, x : Cell) : Nil
+    m = @outs.size
+    sm = @spans.size
+    i = 0
+    while i < n.args.size
+      a = @outs.size
+      ev(n.args[i], x)
+      b = @outs.size
+      ev(n.args[i + 1], x)
+      @spans << Span.new(a, b - a, @outs.size - b)
+      i += 2
+    end
+    e = @outs.size
+    obj_rec(sm, @entries.size)
+    while @spans.size > sm
+      @spans.pop
+    end
+    collapse(m, e)
+  end
+
+  def obj_rec(k : Int32, ksm : Int32) : Nil
+    if k == @spans.size
+      m2 = @entries.size
+      km2 = @keys.length
+      i = ksm
+      while i < m2
+        q = @entries[i]
+        push_key(key_of(q), q.cell)
+        i += 1
+      end
+      @outs << new_obj(m2, km2)
+      return
+    end
+    sp = @spans[k]
+    sp.nk.times do |i|
+      key = @outs[sp.at + i]
+      raise "object keys must be strings" unless kind(key) == 4
+      sp.nv.times do |j|
+        v = @outs[sp.at + sp.nk + j]
+        m = @entries.size
+        km = @keys.length
+        push_key(sval(key), v)
+        obj_rec(k + 1, ksm)
+        trim_entries(m)
+      end
+    end
+  end
+
+  def ev_if(n : Node, x : Cell) : Nil
+    m = @outs.size
+    ev(n.a, x)
+    e = @outs.size
+    i = m
+    while i < e
+      ev(@outs[i].truthy ? n.b : n.c, x)
+      i += 1
+    end
+    collapse(m, e)
+  end
+
+  def ev_reduce(n : Node, x : Cell) : Nil
+    m = @outs.size
+    ev(n.b, x)
+    raise "reduce: initial value must have one output" unless @outs.size == \
+                                                                m + 1
+    ev(n.a, x)
+    e = @outs.size
+    acc = @outs[m]
+    i = m + 1
+    while i < e
+      @envid << n.id
+      @envval << @outs[i]
+      r0 = @outs.size
+      ev(n.c, acc)
+      acc = @outs.size > r0 ? @outs[@outs.size - 1] : Cell.new
+      trim(r0)
+      unbind
+      i += 1
+    end
+    trim(m)
+    @outs << acc
+  end
+
+  def ev_foreach(n : Node, x : Cell) : Nil
+    m = @outs.size
+    ev(n.b, x)
+    raise "foreach: initial value must have one output" unless @outs.size == \
+                                                                 m + 1
+    ev(n.a, x)
+    e = @outs.size
+    acc = @outs[m]
+    i = m + 1
+    while i < e
+      @envid << n.id
+      @envval << @outs[i]
+      r0 = @outs.size
+      ev(n.c, acc)
+      r1 = @outs.size
+      j = r0
+      while j < r1
+        acc = @outs[j]
+        if n.d >= 0
+          ev(n.d, acc)
+        else
+          @outs << acc
+        end
+        j += 1
+      end
+      collapse(r0, r1)
+      unbind
+      i += 1
+    end
+    collapse(m, e)
+  end
+
+  def ev_as(n : Node, x : Cell) : Nil
+    m = @outs.size
+    ev(n.a, x)
+    e = @outs.size
+    i = m
+    while i < e
+      @envid << n.id
+      @envval << @outs[i]
+      ev(n.b, x)
+      unbind
+      i += 1
+    end
+    collapse(m, e)
+  end
+
+  def ev_call(n : Node, x : Cell) : Nil
+    d = @defs[n.id]
+    if d.params.empty?
+      ev(d.body, x) if d.body >= 0
+      return
+    end
+    m = @outs.size
+    n.args.each do |a|
+      ev(a, x)
+      @outs << Cell.new
+    end
+    e = @outs.size
+    raise "arguments with several outputs are not supported" unless e - m == \
+                                                                      2 * n.args.size
+    n.args.size.times do |k|
+      @envid << d.params[k]
+      @envval << @outs[m + 2 * k]
+    end
+    ev(d.body, x) if d.body >= 0
+    unbind(n.args.size)
+    collapse(m, e)
+  end
+
+  def builtin(n : Node, x : Cell) : Nil
+    case n.text
+    when "empty"    then return
+    when "length"   then @outs << length_of(x)
+    when "not"      then @outs << Cell.bool(!x.truthy)
+    when "reverse"  then @outs << reverse_cell(x)
+    when "sort"     then @outs << sort_cell(x)
+    when "min"      then @outs << minmax_cell(x, false)
+    when "max"      then @outs << minmax_cell(x, true)
+    when "add"      then @outs << add_cell(x)
+    when "tostring" then @outs << (kind(x) == 4 ? x : tojson_cell(x))
+    when "tojson"   then @outs << tojson_cell(x)
+    when "fromjson" then @outs << fromjson_cell(x)
+    when "type"     then @outs << new_str(type_name(x).as_tape)
+    when "ceil"     then @outs << Cell.num(x.number.ceil)
+    when "floor"    then @outs << Cell.num(x.number.floor)
+    when "keys"     then @outs << keys_cell(x)
+    when "strings"  then @outs << x if kind(x) == 4
+    when "numbers"  then @outs << x if kind(x) == 3
+    when "arrays"   then @outs << x if kind(x) == 5
+    when "objects"  then @outs << x if kind(x) == 6
+    when "recurse"  then recurse_cell(x)
+    else                 builtin_f(n, x)
+    end
+  end
+
+  def builtin_f(n : Node, x : Cell) : Nil
+    m = @outs.size
+    if n.text == "range"
+      ev_range(n, x)
+      return
+    end
+    if n.text == "select"
+      ev(n.args[0], x)
+      e = @outs.size
+      i = m
+      while i < e
+        @outs << x if @outs[i].truthy
+        i += 1
+      end
+      collapse(m, e)
+      return
+    end
+    if n.text == "last" || n.text == "first"
+      ev(n.args[0], x)
+      if @outs.size > m
+        c = n.text == "last" ? @outs[@outs.size - 1] : @outs[m]
+        trim(m)
+        @outs << c
+      end
+      return
+    end
+    if n.text == "join"
+      ev(n.args[0], x)
+      e = @outs.size
+      i = m
+      while i < e
+        @outs << join_cell(x, @outs[i])
+        i += 1
+      end
+      collapse(m, e)
+      return
+    end
+    if n.text == "group_by"
+      ev_group(n, x)
+      return
+    end
+    raise "unknown builtin"
+  end
+
+  def ev_range(n : Node, x : Cell) : Nil
+    m = @outs.size
+    ev(n.args[0], x)
+    e1 = @outs.size
+    if n.args.size == 1
+      i = m
+      while i < e1
+        hi = @outs[i].number
+        v = 0.0
+        while v < hi
+          @outs << Cell.num(v)
+          v += 1
+        end
+        i += 1
+      end
+      collapse(m, e1)
+      return
+    end
+    ev(n.args[1], x)
+    e2 = @outs.size
+    ev(n.args[2], x) if n.args.size == 3
+    e3 = @outs.size
+    i = m
+    while i < e1
+      j = e1
+      while j < e2
+        lo = @outs[i].number
+        hi = @outs[j].number
+        if n.args.size == 2
+          range_values(lo, hi, 1.0)
+        else
+          k = e2
+          while k < e3
+            range_values(lo, hi, @outs[k].number)
+            k += 1
+          end
+        end
+        j += 1
+      end
+      i += 1
+    end
+    collapse(m, e3)
+  end
+
+  def range_values(lo : Float64, hi : Float64, by : Float64) : Nil
+    v = lo
+    if by > 0
+      while v < hi
+        @outs << Cell.num(v)
+        v += by
+      end
+    elsif by < 0
+      while v > hi
+        @outs << Cell.num(v)
+        v += by
+      end
+    end
+  end
+
+  def ev_group(n : Node, x : Cell) : Nil
+    m = @outs.size
+    pm = @pairs.size
+    at, count = items(x)
+    count.times do |i|
+      it = cell(at + i * 9)
+      r0 = @outs.size
+      ev(n.args[0], it)
+      raise "group_by: key must have one output" unless @outs.size == r0 + 1
+      @pairs << Pair.new(@outs[r0], it)
+      trim(r0)
+    end
+    sort_pairs(pm)
+    i = pm
+    while i < @pairs.size
+      j = i + 1
+      while j < @pairs.size && cmp(@pairs[j].key, @pairs[i].key) == 0
+        j += 1
+      end
+      g0 = @outs.size
+      k = i
+      while k < j
+        @outs << @pairs[k].value
+        k += 1
+      end
+      g = new_arr(g0)
+      trim(g0)
+      @outs << g
+      i = j
+    end
+    trim_pairs(pm)
+    r = new_arr(m)
+    trim(m)
+    @outs << r
+  end
+
+  def run(text : String, root : Int32, show : Bool,
+          h : UInt64) : {Int64, Int64, Int64, UInt64}
+    reset(text)
+    nin = 0_i64
+    nout = 0_i64
+    nbytes = 0_i64
+    loop do
+      ws
+      break if @sc.offset >= @sc.string.bytesize
+      v = parse_value
+      nin += 1
+      ev(root, v)
+      @outs.each do |c|
+        emit(@ob, c)
+        @ob.push(10_u8)
+        nout += 1
+      end
+      @outs.clear
+      output = @ob.finish
+      output.each_byte { |c| h = (h ^ c.to_u64) &* 1099511628211_u64 }
+      nbytes += output.bytesize
+      STDOUT << output if show
+      @ob.clear
+      @pool.clear
+    end
+    {nin, nout, nbytes, h}
+  end
+end
+
+# The input buffers of one batch; the filter is parsed once, before.
+def next_batch(parser : Parser, root : Int32, show : Bool, bulk : Bool,
+               h : UInt64)
+  engine = Engine.new(parser.nodes, parser.defs, 65536)
+  nin = 0_i64
+  nout = 0_i64
+  nbytes = 0_i64
+  lines = 0
+  while lines < 256
+    line = bulk ? read_stream(STDIN) : STDIN.read_line_tape
+    break unless line && !(bulk && line.empty?)
+    ni, no, nb, h = engine.run(line, root, show, h)
+    nin += ni
+    nout += no
+    nbytes += nb
+    lines += 1
+    break if bulk
+  end
+  lines == 0 ? nil : {nin, nout, nbytes, h}
+end
+
+show = false
+bulk = false
+fi = 0
+av = Program.arguments
+while av.size > fi && (av[fi] == "-o" || av[fi] == "-b")
+  if av[fi] == "-o"
+    show = true
+  else
+    bulk = true
+  end
+  fi += 1
+end
+if av.size <= fi
+  STDERR.puts "usage: jqg [-o] '<filter>' < input"
+  exit 1
+end
+filter = av[fi]
+parser = Parser.new(filter)
+root = parser.parse
+h = 14695981039346656037_u64
+nin = 0_i64
+nout = 0_i64
+nbytes = 0_i64
+done = false
+until done
+  if batch = next_batch(parser, root, show, bulk, h)
+    ni, no, nb, h = batch
+    nin += ni
+    nout += no
+    nbytes += nb
+  else
+    done = true
+  end
+  done = true if bulk
+end
+puts "inputs #{nin}"
+puts "outputs #{nout}"
+puts "bytes #{nbytes}"
+puts "fnv #{h}"

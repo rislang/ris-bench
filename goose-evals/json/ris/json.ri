@@ -1,0 +1,683 @@
+# Goose JSON DOM: one compact byte pool, inline strings and Int32 byte links.
+
+import std/tuple
+import std/int
+import std/file
+import std/io
+import std/time::{Time}
+
+# One sized read of the whole file onto the tape.
+def read_text(path : String) : String
+  File.read(path)
+end
+
+def write_text(path : String, text : String) : Nil
+  io = File.open(path, "w", owner: Program.tape)
+  defer io.close
+  io << text
+end
+
+BASIS = 14695981039346656037_u64
+PRIME =        1099511628211_u64
+POW10 = {1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10,
+         1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22}
+
+def mix(h : UInt64, x : UInt64) : UInt64
+  (h ^ x) &* PRIME
+end
+
+def phase(seconds : Float64) : String
+  ticks = (seconds * 10000.0 + 0.5).to_i64
+  String.build(32) do |writer|
+    writer << ticks // 10000 << "."
+    fraction = ticks % 10000
+    place = 1000_i64
+    4.times do
+      writer.push((48 + fraction // place).to_u8)
+      fraction %= place
+      place //= 10
+    end
+  end
+end
+
+def hex64(value : UInt64) : String
+  String.build(16) do |writer|
+    16.times do |i|
+      digit = ((value >> ((15 - i) * 4)) & 15).to_i32
+      writer.push("0123456789abcdef"[digit])
+    end
+  end
+end
+
+# True when no byte of w is below 32, a quote or a backslash.
+def plain8(w : UInt64) : Bool
+  ones = 0x0101010101010101_u64
+  q = w ^ (ones &* 34)
+  b = w ^ (ones &* 92)
+  bad = ((w &- ones &* 32) & ~w) | ((q &- ones) & ~q) | ((b &- ones) & ~b)
+  (bad & 0x8080808080808080_u64) == 0
+end
+
+def blank(c : UInt8) : Bool
+  c == 32 || c == 10 || c == 13 || c == 9
+end
+
+# The high bit of each byte of w that is exactly b (no carry between bytes).
+def eq8(w : UInt64, b : UInt64) : UInt64
+  low7 = 0x7F7F7F7F7F7F7F7F_u64
+  x = w ^ (0x0101010101010101_u64 &* b)
+  ~(((x & low7) &+ low7) | x) & 0x8080808080808080_u64
+end
+
+# The high bit of each byte of w that is not a space, newline, return or tab.
+def not_space8(w : UInt64) : UInt64
+  ~(eq8(w, 32) | eq8(w, 10) | eq8(w, 13) | eq8(w, 9)) & 0x8080808080808080_u64
+end
+
+# True when no byte of w is a quote or a backslash.
+def no_quote8(w : UInt64) : Bool
+  ones = 0x0101010101010101_u64
+  q = w ^ (ones &* 34)
+  b = w ^ (ones &* 92)
+  (((q &- ones) & ~q) | ((b &- ones) & ~b)) & 0x8080808080808080_u64 == 0
+end
+
+@[OnTape]
+struct Document
+  @nodes : Int32
+  @slow_floats : Int32
+  @strbytes : Int64
+  @walk : UInt64
+  @qhits : Int64
+  @qhash : UInt64
+
+  def initialize(text : String)
+    @sc = String::Scanner.new(text)
+    # Nodes and length prefixes take more than the text: reserved at its
+    # size, the pool outgrew it and moved once, about 1 MB copied.
+    @pool = Array(UInt8).new(@sc.string.bytesize * 2)
+    @scratch = String::Builder.new(256)
+    @output = String::Builder.new(@sc.string.bytesize)
+    @float_text = String::Builder.new(32)
+    @digits = String::Builder.new(32)
+    @counts = Array(Int64).new(8) { 0_i64 }
+    @nodes = 0
+    @slow_floats = 0
+    @strbytes = 0_i64
+    @walk = BASIS
+    @qhits = 0_i64
+    @qhash = BASIS
+  end
+
+  def fail(message : String) : NoReturn
+    raise "parse error at #{@sc.offset}: #{message}"
+  end
+
+  # A local cursor: one scanner move at the end, not one per byte. After
+  # the first blank, eight bytes a step: a newline and its indentation.
+  # Inlined: ris left it a call, 3 to 4% of the cycles.
+  @[AlwaysInline]
+  def skip_ws : Nil
+    text = @sc.string
+    n = text.bytesize
+    p = @sc.offset
+    return if p >= n || !blank(text[p])
+    p += 1
+    while p + 8 <= n
+      other = not_space8(text.read_bytes_at(UInt64, p))
+      if other != 0
+        p += other.trailing_zeros_count // 8
+        @sc.advance(p - @sc.offset)
+        return
+      end
+      p += 8
+    end
+    while p < text.bytesize && blank(text[p])
+      p += 1
+    end
+    @sc.advance(p - @sc.offset)
+  end
+
+  def expect(c : UInt8, message : String) : Nil
+    fail(message) unless @sc.offset < @sc.string.bytesize && \
+                            @sc.string[@sc.offset] == c
+    @sc.advance
+  end
+
+  def hex4 : Int32
+    fail("short \\u escape") if @sc.offset + 4 > @sc.string.bytesize
+    cp = 0
+    4.times do
+      c = @sc.string[@sc.offset]
+      d = if c >= 48 && c <= 57
+            c.to_i32 - 48
+          elsif c >= 97 && c <= 102
+            c.to_i32 - 87
+          elsif c >= 65 && c <= 70
+            c.to_i32 - 55
+          else
+            fail("bad hex digit")
+          end
+      cp = (cp << 4) | d
+      @sc.advance
+    end
+    cp
+  end
+
+  def utf8(cp : Int32) : Nil
+    if cp < 0x80
+      @scratch.push(cp.to_u8)
+    elsif cp < 0x800
+      @scratch.push((0xC0 | (cp >> 6)).to_u8)
+      @scratch.push((0x80 | (cp & 63)).to_u8)
+    elsif cp < 0x10000
+      @scratch.push((0xE0 | (cp >> 12)).to_u8)
+      @scratch.push((0x80 | ((cp >> 6) & 63)).to_u8)
+      @scratch.push((0x80 | (cp & 63)).to_u8)
+    else
+      @scratch.push((0xF0 | (cp >> 18)).to_u8)
+      @scratch.push((0x80 | ((cp >> 12) & 63)).to_u8)
+      @scratch.push((0x80 | ((cp >> 6) & 63)).to_u8)
+      @scratch.push((0x80 | (cp & 63)).to_u8)
+    end
+  end
+
+  # Unescaped strings borrow input; escaped ones reuse a single decoding buffer.
+  # The caller copies the result inline before parsing another string.
+  def parse_string : String
+    text = @sc.string
+    n = text.bytesize
+    start = @sc.offset
+    p = start
+    # Eight bytes a step while none is a quote or a backslash.
+    while p + 8 <= n && no_quote8(text.read_bytes_at(UInt64, p))
+      p += 8
+    end
+    while p < n
+      c = text[p]
+      if c == 34
+        @sc.advance(p + 1 - start)
+        return text[start, p - start]
+      end
+      break if c == 92
+      p += 1
+    end
+    @sc.advance(p - start)
+    @scratch.clear
+    @scratch.append(@sc.string[start, @sc.offset - start])
+    while @sc.offset < @sc.string.bytesize
+      c = @sc.string[@sc.offset]
+      @sc.advance
+      return @scratch.finish if c == 34
+      if c != 92
+        @scratch.push(c)
+        next
+      end
+      fail("unterminated escape") if @sc.offset >= @sc.string.bytesize
+      e = @sc.string[@sc.offset]
+      @sc.advance
+      case e
+      when 34, 92, 47 then @scratch.push(e)
+      when 98         then @scratch.push(8_u8)
+      when 102        then @scratch.push(12_u8)
+      when 110        then @scratch.push(10_u8)
+      when 114        then @scratch.push(13_u8)
+      when 116        then @scratch.push(9_u8)
+      when 117
+        cp = hex4
+        if cp >= 0xD800 && cp < 0xDC00
+          expect(92_u8, "lone surrogate")
+          expect(117_u8, "lone surrogate")
+          lo = hex4
+          fail("bad low surrogate") unless lo >= 0xDC00 && lo < 0xE000
+          cp = 0x10000 + ((cp - 0xD800) << 10) + lo - 0xDC00
+        end
+        utf8(cp)
+      else
+        fail("bad escape")
+      end
+    end
+    fail("unterminated string")
+  end
+
+  def link(at : Int32, target : Int32) : Nil
+    @pool.write_bytes_at(at, target)
+  end
+
+  def follow(at : Int32) : Int32
+    @pool.read_bytes_at(Int32, at)
+  end
+
+  def push_string(s : String) : Nil
+    n = s.bytesize
+    loop do
+      @pool << ((n & 127) | (n >= 128 ? 128 : 0)).to_u8
+      n >>= 7
+      break if n == 0
+    end
+    @pool.append(s)
+  end
+
+  # Return byte start and length of an inline varint-prefixed string.
+  def span(at : Int32) : {Int32, Int32}
+    n = 0
+    shift = 0
+    loop do
+      c = @pool[at]
+      at += 1
+      n |= (c & 127).to_i32 << shift
+      break if c < 128
+      shift += 7
+    end
+    {at, n}
+  end
+
+  def value_at(node : Int32) : Int32
+    s, n = span(node + 4)
+    s + n
+  end
+
+  def number : Nil
+    start = @sc.offset
+    neg = @sc.string[@sc.offset] == 45
+    @sc.advance if neg
+    mant = 0_u64
+    digits = 0
+    text = @sc.string
+    p = @sc.offset
+    while p < text.bytesize && text[p] >= 48 && text[p] <= 57
+      mant = mant &* 10 &+ (text[p] - 48).to_u64
+      p += 1
+    end
+    digits = p - @sc.offset
+    @sc.advance(digits)
+    fail("bad number") if digits == 0
+    exp10 = 0
+    integer = true
+    if @sc.offset < @sc.string.bytesize && @sc.string[@sc.offset] == 46
+      integer = false
+      @sc.advance
+      fstart = @sc.offset
+      p = fstart
+      while p < text.bytesize && text[p] >= 48 && text[p] <= 57
+        mant = mant &* 10 &+ (text[p] - 48).to_u64
+        p += 1
+      end
+      @sc.advance(p - fstart)
+      fail("bad fraction") if @sc.offset == fstart
+      exp10 = fstart - @sc.offset
+      digits += @sc.offset - fstart
+    end
+    if @sc.offset < @sc.string.bytesize && (@sc.string[@sc.offset] == 101 || \
+          @sc.string[@sc.offset] == 69)
+      integer = false
+      @sc.advance
+      eneg = false
+      if @sc.offset < @sc.string.bytesize && (@sc.string[@sc.offset] == 45 || @sc.string[@sc.offset] == 43)
+        eneg = @sc.string[@sc.offset] == 45
+        @sc.advance
+      end
+      e = 0
+      estart = @sc.offset
+      p = estart
+      while p < text.bytesize && text[p] >= 48 && text[p] <= 57
+        e = e * 10 + (text[p] - 48).to_i32 if e < 100000
+        p += 1
+      end
+      @sc.advance(p - estart)
+      fail("bad exponent") if @sc.offset == estart
+      exp10 += eneg ? -e : e
+    end
+    if integer && digits <= 18
+      v = mant.to_i64
+      v = -v if neg
+      @pool << 4_u8
+      @pool.write_bytes(v.unsafe_to_u64)
+      return
+    end
+    f = 0.0
+    if digits <= 19 && mant < 9007199254740992_u64 && exp10 >= -22 && exp10 \
+         <= 22
+      f = mant.to_f64
+      f = exp10 < 0 ? f / POW10[-exp10] : f * POW10[exp10]
+      f = -f if neg
+    else
+      @slow_floats += 1
+      f = @sc.string[start, @sc.offset - start].to_f
+    end
+    @pool << 8_u8
+    @pool.write_bytes(IyiFloatText.bits_of(f))
+  end
+
+  def literal(word : String, tag : UInt8) : Nil
+    fail("bad literal") unless @sc.offset + word.bytesize <= \
+                                 @sc.string.bytesize &&
+                                 @sc.string[@sc.offset, word.bytesize] == word
+    @sc.advance(word.bytesize)
+    @pool << tag
+  end
+
+  def new_node(key : String) : Int32
+    node = @pool.size
+    @pool.write_bytes(-1_i32)
+    push_string(key)
+    @nodes += 1
+    node
+  end
+
+  def parse_value(node : Int32) : Int32
+    skip_ws
+    fail("unexpected end") if @sc.offset >= @sc.string.bytesize
+    c = @sc.string[@sc.offset]
+    if c == 123 || c == 91
+      object = c == 123
+      close = object ? 125_u8 : 93_u8
+      @sc.advance
+      @pool << (object ? 7_u8 : 6_u8)
+      first = @pool.size
+      @pool.write_bytes(-1_i32)
+      skip_ws
+      if @sc.offset < @sc.string.bytesize && @sc.string[@sc.offset] == close
+        @sc.advance
+        return node
+      end
+      last = -1
+      loop do
+        k = "".as_tape
+        if object
+          skip_ws
+          expect(34_u8, "expected key")
+          k = parse_string
+          skip_ws
+          expect(58_u8, "expected colon")
+        end
+        # Consume the scratch view before recursive parsing reuses scratch.
+        child = new_node(k)
+        k = ""
+        parse_value(child)
+        link(last < 0 ? first : last, child)
+        last = child
+        skip_ws
+        fail(object ? "unclosed object" : "unclosed array") if @sc.offset >= \
+                                                                 @sc.string.bytesize
+        if @sc.string[@sc.offset] == 44
+          @sc.advance
+          next
+        end
+        expect(close, object ? "expected , or }" : "expected , or ]")
+        break
+      end
+    elsif c == 34
+      @sc.advance
+      @pool << 5_u8
+      push_string(parse_string)
+    elsif c == 116
+      literal("true", 3_u8)
+    elsif c == 102
+      literal("false", 2_u8)
+    elsif c == 110
+      literal("null", 1_u8)
+    else
+      number
+    end
+    node
+  end
+
+  def mix_span(h : UInt64, at : Int32) : UInt64
+    s, n = span(at)
+    str = @pool.bytes[s, n]
+    r = h
+    i = 0
+    while i < str.bytesize
+      r = mix(r, str[i].to_u64)
+      i += 1
+    end
+    mix(r, n.to_u64)
+  end
+
+  def query(first : Int32) : Nil
+    {"id", "name", "type", "url", "text"}.each_with_index do |key, q|
+      child = first
+      found = false
+      while child >= 0
+        s, n = span(child + 4)
+        equal = n == key.bytesize
+        if equal
+          n.times { |i| equal = false if @pool[s + i] != key.as_tape[i] }
+        end
+        if equal
+          tag = @pool[value_at(child)]
+          tag = 4_u8 if tag == 8
+          @qhits += 1
+          @qhash = mix(@qhash, (q * 16 + tag).to_u64)
+          found = true
+          break
+        end
+        child = follow(child)
+      end
+      @qhash = mix(@qhash, 255_u64) unless found
+    end
+  end
+
+  def walk(node : Int32) : Nil
+    at = value_at(node)
+    kind = @pool[at]
+    tag = kind == 8 ? 4 : kind.to_i32
+    @counts[tag] += 1
+    @walk = mix(@walk, tag.to_u64)
+    case kind
+    when 4
+      f = @pool.read_bytes_at(UInt64, at + 1).unsafe_to_i64.to_f64
+      @walk = mix(@walk, IyiFloatText.bits_of(f))
+    when 8
+      @walk = mix(@walk, @pool.read_bytes_at(UInt64, at + 1))
+    when 5
+      s, n = span(at + 1)
+      @strbytes += n
+      @walk = mix_span(@walk, at + 1)
+    when 6, 7
+      first = follow(at + 1)
+      child = first
+      while child >= 0
+        if kind == 7
+          s, n = span(child + 4)
+          @strbytes += n
+          @walk = mix_span(@walk, child + 4)
+        end
+        walk(child)
+        child = follow(child)
+      end
+      @walk = mix(@walk, 8_u64)
+      query(first) if kind == 7
+    end
+  end
+
+  # Clean runs go output whole, eight bytes a step where the pool has them.
+  def emit_string(at : Int32) : Nil
+    s, n = span(at)
+    str = @pool.bytes[s, n]
+    @output.push(34_u8)
+    run = 0
+    i = 0
+    while i + 8 <= n && plain8(str.read_bytes_at(UInt64, i))
+      i += 8
+    end
+    while i < str.bytesize
+      b = str[i]
+      if b < 32 || b == 34 || b == 92
+        @output.append(str[run, i - run])
+        run = i + 1
+        case b
+        when 34 then @output.append("\\\"")
+        when 92 then @output.append("\\\\")
+        when  8 then @output.append("\\b")
+        when 12 then @output.append("\\f")
+        when 10 then @output.append("\\n")
+        when 13 then @output.append("\\r")
+        when  9 then @output.append("\\t")
+        else
+          @output.append("\\u00")
+          @output.push("0123456789ABCDEF".as_tape[(b >> 4).to_i32])
+          @output.push("0123456789ABCDEF".as_tape[(b & 15).to_i32])
+        end
+      end
+      i += 1
+    end
+    @output.append(str[run, n - run])
+    @output.push(34_u8)
+  end
+
+  # ris supplies the shortest digits; Goose uses %g's notation threshold,
+  # max(15, digit count), padded exponents and .0 for whole fixed numbers.
+  def emit_float(f : Float64) : Nil
+    @float_text.clear
+    @float_text << f
+    text = @float_text.finish
+    if text == "NaN" || text == "Infinity" || text == "-Infinity"
+      @output.append(text == "NaN" ? "nan" : (text == "Infinity" ? "inf" : "-inf"))
+      return
+    end
+    i = 0
+    if text[0] == 45
+      @output.push(45_u8)
+      i += 1
+    end
+    @digits.clear
+    point = 0
+    dot = false
+    while i < text.bytesize && text[i] != 101
+      if text[i] == 46
+        dot = true
+      else
+        @digits.push(text[i])
+        point += 1 unless dot
+      end
+      i += 1
+    end
+    if i < text.bytesize
+      point += text[i + 1, text.bytesize - i - 1].to_i
+    end
+    digits = @digits.finish
+    start = 0
+    while start < digits.bytesize - 1 && digits[start] == 48
+      start += 1
+      point -= 1
+    end
+    stop = digits.bytesize
+    while stop > start + 1 && digits[stop - 1] == 48
+      stop -= 1
+    end
+    digits = digits[start, stop - start]
+    if digits.bytesize == 1 && digits[0] == 48
+      @output.append("0.0")
+      return
+    end
+    x = point - 1
+    n = digits.bytesize
+    if x < -4 || x >= (n > 15 ? n : 15)
+      @output.push(digits[0])
+      if n > 1
+        @output.push(46_u8)
+        @output.append(digits[1, n - 1])
+      end
+      @output.push(101_u8)
+      @output.push(x < 0 ? 45_u8 : 43_u8)
+      e = x < 0 ? -x : x
+      @output.push(48_u8) if e < 10
+      @output << e
+    elsif x < 0
+      @output.append("0.")
+      (-point).times { @output.push(48_u8) }
+      @output.append(digits)
+    else
+      i = 0
+      while i < n || i < point
+        @output.push(46_u8) if i == point
+        @output.push(i < n ? digits[i] : 48_u8)
+        i += 1
+      end
+      @output.append(".0") if n <= point
+    end
+  end
+
+  def emit(node : Int32) : Nil
+    at = value_at(node)
+    kind = @pool[at]
+    case kind
+    when 1 then @output.append("null")
+    when 2 then @output.append("false")
+    when 3 then @output.append("true")
+    when 4 then @output << @pool.read_bytes_at(UInt64, at + 1).unsafe_to_i64
+    when 8 then emit_float(IyiFloatText.from_bits(@pool.read_bytes_at(UInt64, at + 1)))
+    when 5 then emit_string(at + 1)
+    when 6, 7
+      @output.push(kind == 7 ? 123_u8 : 91_u8)
+      child = follow(at + 1)
+      sep = false
+      while child >= 0
+        @output.push(44_u8) if sep
+        sep = true
+        if kind == 7
+          emit_string(child + 4)
+          @output.push(58_u8)
+        end
+        emit(child)
+        child = follow(child)
+      end
+      @output.push(kind == 7 ? 125_u8 : 93_u8)
+    end
+  end
+
+  def run(output_path : String?, read_seconds : Float64) : Nil
+    t1 = Time.monotonic
+    root = parse_value(new_node(""))
+    skip_ws
+    fail("trailing data") unless @sc.offset == @sc.string.bytesize
+    t2 = Time.monotonic
+    walk(root)
+    t3 = Time.monotonic
+    emit(root)
+    t4 = Time.monotonic
+    output = @output.finish
+    oh = BASIS
+    output.each_byte { |b| oh = mix(oh, b.to_u64) }
+    if path = output_path
+      write_text(path, output)
+    end
+    names = {"", "null", "false", "true", "number", "string", "array",
+             "object"}
+    (1...8).each { |t| puts "#{names[t]} #{@counts[t]}" }
+    puts "nodes #{@nodes}"
+    puts "strbytes #{@strbytes}"
+    puts "walk #{hex64(@walk)}"
+    puts "qhits #{@qhits}"
+    puts "qhash #{hex64(@qhash)}"
+    puts "outlen #{output.bytesize}"
+    puts "outhash #{hex64(oh)}"
+    t6 = Time.monotonic
+    STDERR.puts \
+      "phase read #{phase(read_seconds)} parse " \
+      "#{phase((t2 - t1).total_seconds)} " \
+      "walk #{phase((t3 - t2).total_seconds)} emit " \
+      "#{phase((t4 - t3).total_seconds)} " \
+      "hash #{phase((t6 - t4).total_seconds)} free 0.0000"
+    STDERR.puts "pool_nodes #{@nodes} slow_floats #{@slow_floats}"
+  end
+end
+
+if Program.arguments.empty?
+  STDERR.puts "usage: json file.json [output.json]"
+  exit 1
+end
+path = Program.arguments[0]
+unless File.exists?(path)
+  STDERR.puts "cannot read input"
+  exit 1
+end
+t0 = Time.monotonic
+text = read_text(path)
+read_seconds = (Time.monotonic - t0).total_seconds
+tape do
+  doc = Document.new(text)
+  doc.run(Program.arguments.size > 1 ? Program.arguments[1] : nil, read_seconds)
+end

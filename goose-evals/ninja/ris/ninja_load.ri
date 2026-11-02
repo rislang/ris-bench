@@ -1,0 +1,763 @@
+# Goose's Ninja manifest loader: byte views, tape pools and Int32 links.
+
+import std/int
+import std/file
+
+# One sized read of the whole file onto the tape.
+def read_text(path : String) : String
+  File.read(path)
+end
+
+@[OnTape]
+struct Node
+  property path : String
+  property in_edge : Int32
+  property first_use : Int32
+  property nuses : Int32
+  property depth : Int32
+
+  def initialize(@path, @in_edge, @first_use, @nuses, @depth)
+  end
+end
+
+@[OnTape]
+struct Use
+  property node : Int32
+  property next : Int32
+
+  def initialize(@node, @next)
+  end
+end
+
+@[OnTape]
+struct Bind
+  property name : String
+  property value : String
+
+  def initialize(@name, @value)
+  end
+end
+
+@[OnTape]
+struct Rule
+  property bind_start : Int32
+  property nbind : Int32
+
+  def initialize(@bind_start, @nbind)
+  end
+end
+
+@[OnTape]
+struct Edge
+  property rule : Int32
+  property bind_start : Int32
+  property nbind : Int32
+  property ins_start : Int32
+  property n_explicit : Int32
+  property n_implicit : Int32
+  property n_order : Int32
+  property outs_start : Int32
+  property n_outs : Int32
+  property n_implicit_outs : Int32
+
+  def initialize(
+    @rule,
+    @bind_start,
+    @nbind,
+    @ins_start,
+    @n_explicit,
+    @n_implicit,
+    @n_order,
+    @outs_start,
+    @n_outs,
+    @n_implicit_outs,
+  )
+  end
+end
+
+@[OnTape]
+struct Span
+  property s : Int32
+  property e : Int32
+  property dollar : Bool
+
+  def initialize(@s, @e, @dollar)
+  end
+end
+
+def fnv(s : String) : UInt64
+  h = 1469598103934665603_u64
+  s.each_byte { |c| h = (h ^ c.to_u64) &* 1099511628211_u64 }
+  h
+end
+
+def simple(c : UInt8) : Bool
+  (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) ||
+    c == 95 || c == 45
+end
+
+def ident(c : UInt8) : Bool
+  simple(c) || c == 46
+end
+
+def shell_safe(c : UInt8) : Bool
+  simple(c) || c == 43 || c == 46 || c == 47
+end
+
+class Loader
+  @str_bytes : Int64
+  @text_bytes : Int64
+  @lim : Int32
+
+  def initialize(text : String)
+    @sc = String::Scanner.new(text)
+    @nodes = Array(Node).new
+    @uses = Array(Use).new
+    @outs = Array(Int32).new
+    @edges = Array(Edge).new
+    @rules = Array(Rule).new
+    @rbinds = Array(Bind).new
+    @ebinds = Array(Bind).new
+    @vars = Array(Bind).new
+    @by_path = Hash(String, Int32).new
+    @rule_by_name = Hash(String, Int32).new
+    @file_vars = Hash(String, Int32).new
+    @spans = Array(Span).new
+    @str_bytes = 0_i64
+    @text_bytes = @sc.string.bytesize.to_i64
+    @lim = @sc.string.bytesize
+    @rules << Rule.new(0, 0)
+    @rule_by_name["phony".as_tape] = 0
+  end
+
+  def escaped(writer : String::Builder, path : String) : Nil
+    safe = true
+    path.each_byte { |c| safe = false unless shell_safe(c) }
+    if safe
+      writer.append(path)
+      return
+    end
+    writer.push(39_u8)
+    path.each_byte do |c|
+      if c == 39
+        writer.append("'\\''")
+      else
+        writer.push(c)
+      end
+    end
+    writer.push(39_u8)
+  end
+
+  def lookup(writer : String::Builder, name : String, mode : Int32,
+             b0 : Int32, nb : Int32, e : Int32) : Nil
+    if mode == 2
+      ed = @edges[e]
+      if name == "in" || name == "in_newline"
+        ed.n_explicit.times do |k|
+          writer.push(name == "in" ? 32_u8 : 10_u8) if k > 0
+          escaped(writer, @nodes[@uses[ed.ins_start + k].node].path)
+        end
+        return
+      end
+      if name == "out"
+        (ed.n_outs - ed.n_implicit_outs).times do |k|
+          writer.push(32_u8) if k > 0
+          escaped(writer, @nodes[@outs[ed.outs_start + k]].path)
+        end
+        return
+      end
+      ed.nbind.times do |k|
+        b = @ebinds[ed.bind_start + k]
+        if b.name == name
+          writer.append(b.value)
+          return
+        end
+      end
+      r = @rules[ed.rule]
+      r.nbind.times do |k|
+        b = @rbinds[r.bind_start + k]
+        if b.name == name
+          eval_into(writer, b.value, 2, 0, 0, e)
+          return
+        end
+      end
+    elsif mode == 1
+      nb.times do |k|
+        b = @ebinds[b0 + k]
+        if b.name == name
+          writer.append(b.value)
+          return
+        end
+      end
+    end
+    v = @file_vars.fetch(name, -1)
+    writer.append(@vars[v].value) if v >= 0
+  end
+
+  def eval_into(writer : String::Builder, raw : String, mode : Int32,
+                b0 : Int32, nb : Int32, e : Int32) : Nil
+    i = 0
+    while i < raw.bytesize
+      if raw[i] != 36
+        j = i + 1
+        while j < raw.bytesize && raw[j] != 36
+          j += 1
+        end
+        writer.append(raw[i, j - i])
+        i = j
+        next
+      end
+      i += 1
+      d = raw[i]
+      if d == 36 || d == 32 || d == 58
+        writer.push(d)
+        i += 1
+      elsif d == 10 || d == 13
+        i += d == 13 ? 2 : 1
+        while i < raw.bytesize && raw[i] == 32
+          i += 1
+        end
+      elsif d == 123
+        j = i + 1
+        while raw[j] != 125
+          j += 1
+        end
+        lookup(writer, raw[i + 1, j - i - 1], mode, b0, nb, e)
+        i = j + 1
+      else
+        j = i
+        while j < raw.bytesize && simple(raw[j])
+          j += 1
+        end
+        lookup(writer, raw[i, j - i], mode, b0, nb, e)
+        i = j
+      end
+    end
+  end
+
+  def eval_value(sp : Span, mode : Int32, b0 : Int32, nb : Int32) : String
+    raw = @sc.string[sp.s, sp.e - sp.s]
+    return raw unless sp.dollar
+    text = String.build(raw.bytesize) { |w| eval_into(w, raw, mode, b0, nb, 0) }
+    @str_bytes += text.bytesize
+    text
+  end
+
+  def canonical?(p : String) : Bool
+    return false if p.bytesize == 0
+    start = 0
+    normal = false
+    i = 0
+    while i <= p.bytesize
+      if i == p.bytesize || p[i] == 47
+        n = i - start
+        if n == 0
+          return false unless i == 0 && p.bytesize > 1
+        elsif n == 1 && p[start] == 46
+          return false
+        elsif n == 2 && p[start] == 46 && p[start + 1] == 46
+          return false if normal
+        else
+          normal = true
+        end
+        start = i + 1
+      end
+      i += 1
+    end
+    true
+  end
+
+  def canonicalize(p : String) : String
+    # Components are views; marks track normal components, as in Goose.
+    parts = Array(String).new
+    normal = Array(Bool).new
+    i = p.bytesize > 0 && p[0] == 47 ? 1 : 0
+    absolute = i == 1
+    while i < p.bytesize
+      j = i
+      while j < p.bytesize && p[j] != 47
+        j += 1
+      end
+      part = p[i, j - i]
+      if part == ".."
+        if parts.size > 0 && normal[parts.size - 1]
+          parts.pop
+          normal.pop
+        else
+          parts << part
+          normal << false
+        end
+      elsif part.bytesize > 0 && part != "."
+        parts << part
+        normal << true
+      end
+      i = j + 1
+    end
+    String.build(p.bytesize + 1) do |w|
+      w.push(47_u8) if absolute
+      parts.each_with_index do |part, k|
+        w.push(47_u8) if k > 0
+        w.append(part)
+      end
+      w.push(46_u8) if w.length == 0
+    end
+  end
+
+  def intern(sp : Span, b0 : Int32, nb : Int32) : Int32
+    raw = @sc.string[sp.s, sp.e - sp.s]
+    borrowed = !sp.dollar && canonical?(raw)
+    key = raw
+    unless borrowed
+      key = canonicalize(String.build(raw.bytesize) do |w|
+        if sp.dollar
+          eval_into(w, raw, 1, b0, nb, 0)
+        else
+          w.append(raw)
+        end
+      end)
+    end
+    found = @by_path.fetch(key, -1)
+    return found if found >= 0
+    @str_bytes += key.bytesize unless borrowed
+    n = @nodes.size
+    if borrowed
+      @nodes << Node.new(raw, -1, -1, 0, -1)
+    else
+      @nodes << Node.new(key.copy_to(Program.tape), -1, -1, 0, -1)
+    end
+    @by_path[@nodes[n].path] = n
+    n
+  end
+
+  def skip_line : Nil
+    while @sc.offset < @lim && @sc.string[@sc.offset] != 10
+      @sc.advance
+    end
+    @sc.advance if @sc.offset < @lim
+  end
+
+  def skip_blank_lines : Nil
+    while @sc.offset < @lim
+      q = @sc.offset
+      while q < @lim && @sc.string[q] == 32
+        q += 1
+      end
+      return if q < @lim && @sc.string[q] != 10 && @sc.string[q] != 13 && \
+                   @sc.string[q] != 35
+      @sc.offset = q
+      skip_line
+    end
+  end
+
+  def peek_indent : Bool
+    loop do
+      q = @sc.offset
+      while q < @lim && @sc.string[q] == 32
+        q += 1
+      end
+      if q < @lim && @sc.string[q] == 35
+        @sc.offset = q
+        skip_line
+        next
+      end
+      if q > @sc.offset && q < @lim && @sc.string[q] != 10 && @sc.string[q] \
+           != 13
+        @sc.offset = q
+        return true
+      end
+      return false
+    end
+  end
+
+  def skip_spaces : Nil
+    loop do
+      while @sc.offset < @lim && @sc.string[@sc.offset] == 32
+        @sc.advance
+      end
+      if @sc.offset + 1 < @lim && @sc.string[@sc.offset] == 36 && \
+            @sc.string[@sc.offset + 1] == 10
+        @sc.advance(2)
+      elsif @sc.offset + 2 < @lim && @sc.string[@sc.offset] == 36 && \
+               @sc.string[@sc.offset + 1] == 13
+        @sc.advance(3)
+      else
+        return
+      end
+    end
+  end
+
+  def read_ident : String
+    s = @sc.offset
+    while @sc.offset < @lim && ident(@sc.string[@sc.offset])
+      @sc.advance
+    end
+    raise "ninja_load: expected a name at byte #{s}" unless @sc.offset > s
+    @sc.string[s, @sc.offset - s]
+  end
+
+  def expect(c : UInt8) : Nil
+    raise "ninja_load: expected '#{c.chr}' at byte #{@sc.offset}" unless @sc.offset < @lim && @sc.string[@sc.offset] == c
+    @sc.advance
+  end
+
+  def expect_newline : Nil
+    skip_spaces
+    @sc.advance if @sc.offset < @lim && @sc.string[@sc.offset] == 13
+    expect(10_u8) if @sc.offset < @lim
+  end
+
+  # Walks a local index and moves the scanner once at the end.
+  def scan(path : Bool) : Span
+    text = @sc.string
+    s = @sc.offset
+    p = s
+    dollar = false
+    while p < @lim
+      c = text[p]
+      if c == 36
+        dollar = true
+        p += 2
+        if text[p - 1] == 10 || text[p - 1] == 13
+          p += 1 if text[p - 1] == 13
+          while p < @lim && text[p] == 32
+            p += 1
+          end
+        end
+        next
+      end
+      break if c == 10 || c == 13
+      break if path && (c == 32 || c == 58 || c == 124)
+      p += 1
+    end
+    @sc.advance(p - s)
+    Span.new(s, p, dollar)
+  end
+
+  def at_path : Bool
+    @sc.offset < @lim && @sc.string[@sc.offset] != 58 && \
+       @sc.string[@sc.offset] != 124 &&
+        @sc.string[@sc.offset] != 10 && @sc.string[@sc.offset] != 13
+  end
+
+  def scan_paths : Nil
+    loop do
+      skip_spaces
+      return unless at_path
+      @spans << scan(true)
+    end
+  end
+
+  def scan_binding : {String, Span}
+    name = read_ident
+    skip_spaces
+    expect(61_u8)
+    skip_spaces
+    v = scan(false)
+    expect_newline
+    {name, v}
+  end
+
+  def parse_rule : Nil
+    skip_spaces
+    name = read_ident
+    expect_newline
+    b0 = @rbinds.size
+    while peek_indent
+      k, v = scan_binding
+      @rbinds << Bind.new(k, @sc.string[v.s, v.e - v.s])
+    end
+    @rule_by_name[name] = @rules.size
+    @rules << Rule.new(b0, @rbinds.size - b0)
+  end
+
+  def parse_build : Nil
+    @spans.clear
+    scan_paths
+    n_exp_outs = @spans.size
+    if @sc.offset < @lim && @sc.string[@sc.offset] == 124
+      @sc.advance
+      scan_paths
+    end
+    n_outs = @spans.size
+    skip_spaces
+    expect(58_u8)
+    skip_spaces
+    rname = read_ident
+    rule = @rule_by_name.fetch(rname, -1)
+    raise "ninja_load: unknown rule" if rule < 0
+    scan_paths
+    n_explicit = @spans.size - n_outs
+    n_implicit = 0
+    n_order = 0
+    if @sc.offset + 1 < @lim && @sc.string[@sc.offset] == 124 &&
+       @sc.string[@sc.offset + 1] != 124 && @sc.string[@sc.offset + 1] != 64
+      @sc.advance
+      m = @spans.size
+      scan_paths
+      n_implicit = @spans.size - m
+    end
+    if @sc.offset + 1 < @lim && @sc.string[@sc.offset] == 124 && \
+          @sc.string[@sc.offset + 1] == 124
+      @sc.advance(2)
+      m = @spans.size
+      scan_paths
+      n_order = @spans.size - m
+    end
+    n_ins = @spans.size
+    if @sc.offset + 1 < @lim && @sc.string[@sc.offset] == 124 && \
+          @sc.string[@sc.offset + 1] == 64
+      @sc.advance(2)
+      scan_paths
+    end
+    expect_newline
+    b0 = @ebinds.size
+    while peek_indent
+      k, v = scan_binding
+      # A value with a variable is built and kept; plain text is a view.
+      if v.dollar
+        @ebinds << Bind.new(k, eval_value(v, 0, 0, 0).copy_to(Program.tape))
+      else
+        @ebinds << Bind.new(k, @sc.string[v.s, v.e - v.s])
+      end
+    end
+    nb = @ebinds.size - b0
+    ei = @edges.size
+    @edges << Edge.new(rule, b0, nb, @uses.size, n_explicit, n_implicit,
+      n_order, @outs.size, n_outs, n_outs - n_exp_outs)
+    n_outs.times do |k|
+      ni = intern(@spans[k], b0, nb)
+      set_in_edge(ni, ei)
+      @outs << ni
+    end
+    k = n_outs
+    while k < n_ins
+      ni = intern(@spans[k], b0, nb)
+      add_use(ni)
+      k += 1
+    end
+    while k < @spans.size
+      intern(@spans[k], b0, nb)
+      k += 1
+    end
+  end
+
+  # Node updates live in their own calls: a Node read never spans a growth.
+  def set_in_edge(ni : Int32, ei : Int32) : Nil
+    n = @nodes[ni]
+    raise "ninja_load: multiple rules generate" if n.in_edge >= 0
+    n.in_edge = ei
+    @nodes[ni] = n
+  end
+
+  def add_use(ni : Int32) : Nil
+    first = @nodes[ni].first_use
+    ui = @uses.size
+    @uses << Use.new(ni, first)
+    n = @nodes[ni]
+    n.first_use = ui
+    n.nuses += 1
+    @nodes[ni] = n
+  end
+
+  def parse_pool : Nil
+    skip_spaces
+    read_ident
+    expect_newline
+    while peek_indent
+      scan_binding
+    end
+  end
+
+  # Reads the top-level keyword: 1 build ... 6 include, 0 a variable.
+  def read_keyword : Int32
+    word = read_ident
+    return 1 if word == "build"
+    return 2 if word == "rule"
+    return 3 if word == "pool"
+    return 4 if word == "default"
+    return 5 if word == "subninja"
+    return 6 if word == "include"
+    0
+  end
+
+  # Each included file stays in its own buffer; existing views never move.
+  def parse_include : Nil
+    skip_spaces
+    sp = scan(true)
+    expect_newline
+    path = eval_value(sp, 0, 0, 0)
+    included = read_text(path).copy_to(Program.tape)
+    @text_bytes += included.bytesize
+    saved = @sc
+    @sc = String::Scanner.new(included)
+    parse_range(0, included.bytesize)
+    @sc = saved
+  end
+
+  # A file variable whose name starts at byte ws.
+  def parse_var(ws : Int32) : Nil
+    word = @sc.string[ws, @sc.offset - ws]
+    skip_spaces
+    expect(61_u8)
+    skip_spaces
+    v = scan(false)
+    expect_newline
+    vi = @file_vars.fetch(word, -1)
+    if vi < 0
+      vi = @vars.size
+      @file_vars[word] = vi
+      @vars << Bind.new(word, "")
+    end
+    if v.dollar
+      @vars[vi] = Bind.new(word, eval_value(v, 0, 0, 0).copy_to(Program.tape))
+    else
+      @vars[vi] = Bind.new(word, @sc.string[v.s, v.e - v.s])
+    end
+    nil
+  end
+
+  # The scan position as a plain Int32, not a read of the scanner.
+  def offset : Int32
+    @sc.offset
+  end
+
+  def parse_range(s : Int32, e : Int32) : Nil
+    save_pos = @sc.offset
+    save_lim = @lim
+    @sc.offset = s
+    @lim = e
+    loop do
+      skip_blank_lines
+      ws = offset
+      break unless ws < @lim
+      kind = read_keyword
+      if kind == 1
+        parse_build
+      elsif kind == 2
+        parse_rule
+      elsif kind == 3
+        parse_pool
+      elsif kind == 4
+        skip_line
+      elsif kind == 5
+        raise "ninja_load: subninja is not supported"
+      elsif kind == 6
+        parse_include
+      else
+        parse_var(ws)
+      end
+    end
+    @sc.offset = save_pos
+    @lim = save_lim
+  end
+
+  def depth(ni : Int32) : Int32
+    n = @nodes[ni]
+    return n.depth if n.depth >= 0
+    return 0 if n.depth == -2
+    n.depth = -2
+    @nodes[ni] = n
+    best = 0
+    if n.in_edge >= 0
+      e = @edges[n.in_edge]
+      tot = e.n_explicit + e.n_implicit + e.n_order
+      best = 1 if tot == 0
+      tot.times do |k|
+        d = depth(@uses[e.ins_start + k].node) + 1
+        best = d if d > best
+      end
+    end
+    n = @nodes[ni]
+    n.depth = best
+    @nodes[ni] = n
+    best
+  end
+
+  # Keep command buffer views inside this pass, before the graph lookups.
+  def command_totals
+    ncmd = 0_i64
+    cbytes = 0_i64
+    ch = 0_u64
+    cmd = String::Builder.new(1024)
+    @edges.size.times do |i|
+      cmd.clear
+      lookup(cmd, "command", 2, 0, 0, i)
+      text = cmd.finish
+      if text.bytesize > 0
+        ncmd += 1
+        cbytes += text.bytesize
+        ch = ch &+ fnv(text)
+      end
+    end
+    {ncmd, cbytes, ch}
+  end
+
+  def run(mode : String) : Nil
+    parse_range(0, @sc.string.bytesize)
+    puts "#{@nodes.size} #{@edges.size}"
+    return if mode == "load"
+    if mode == "stats"
+      slots = 0
+      if @nodes.size > 0
+        slots = 8
+        while @nodes.size.to_i64 * 3 > slots.to_i64 * 2
+          slots *= 2
+        end
+      end
+      puts "text #{@text_bytes} strs #{@str_bytes} nodes #{@nodes.size} uses " \
+           "#{@uses.size} " \
+           "outs #{@outs.size} edges #{@edges.size} ebinds #{@ebinds.size} " \
+           "rbinds #{@rbinds.size} rules #{@rules.size} dict slots #{slots}"
+      return
+    end
+    ins = 0_i64
+    nouts = 0_i64
+    @edges.each do |e|
+      ins += e.n_explicit + e.n_implicit + e.n_order
+      nouts += e.n_outs
+    end
+    puts "#{ins} #{nouts}"
+    ph = 0_u64
+    @nodes.each { |n| ph = ph &+ fnv(n.path) }
+    puts ph
+    ncmd, cbytes, ch = command_totals
+    puts "#{ncmd} #{cbytes} #{ch}"
+    x = 88172645463325252_u64
+    fanin = 0_i64
+    fanout = 0_i64
+    100000.times do
+      x = x ^ (x << 13)
+      x = x ^ (x >> 7)
+      x = x ^ (x << 17)
+      e = @edges[(x % @edges.size.to_u64).to_i32]
+      t = @nodes[@outs[e.outs_start]].path
+      ni = @by_path.fetch(t, -1)
+      raise "lookup failed" if ni < 0
+      n = @nodes[ni]
+      raise "no producer" if n.in_edge < 0
+      ie = @edges[n.in_edge]
+      fanin += ie.n_explicit + ie.n_implicit + ie.n_order
+      fanout += n.nuses
+    end
+    puts "#{fanin} #{fanout}"
+    sources = 0_i64
+    maxd = 0
+    sumd = 0_i64
+    @nodes.size.times do |i|
+      sources += 1 if @nodes[i].in_edge < 0
+      d = depth(i)
+      maxd = d if d > maxd
+      sumd += d
+    end
+    puts "#{sources} #{maxd} #{sumd}"
+  end
+end
+
+path = Program.arguments.size > 0 ? Program.arguments[0] : "build.ninja"
+unless File.exists?(path)
+  puts "cannot read #{path}"
+  exit 1
+end
+text = read_text(path).copy_to(Program.tape)
+loader = Loader.new(text)
+loader.run(Program.arguments.size > 1 ? Program.arguments[1].as_tape : "")

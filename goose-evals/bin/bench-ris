@@ -1,0 +1,101 @@
+#!/bin/bash
+# Time each ris port against its Goose row on the inputs of one size:
+# checks that stdout is equal, then prints the median wall time and peak
+# RSS of N runs (wall time includes /usr/bin/time), default 5, as a table.
+# JOBS=8 runs 8 copies at once, one per physical core, and times the batch.
+# Usage: [JOBS=8] bin/bench-ris [small|medium|large] [N]
+set -euo pipefail
+source "$(dirname "$0")/env.sh"
+export LC_ALL=C
+SIZE=${1:-small}; N=${2:-5}; JOBS=${JOBS:-1}
+# One logical CPU per physical core: the first of each sibling list.
+CPUS=($(cat /sys/devices/system/cpu/cpu*/topology/thread_siblings_list \
+  | cut -d- -f1 | cut -d, -f1 | sort -nu))
+[ "$JOBS" -le "${#CPUS[@]}" ] || {
+  echo "only ${#CPUS[@]} physical cores"; exit 1;
+}
+case $SIZE in
+  small) s=s;; medium) s=m;; large) s=l;;
+  *) echo "size?"; exit 1;;
+esac
+T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
+
+# median <cmd...> < input: prints "seconds MB"
+median() {
+  for _ in $(seq "$N"); do
+    local a b pid
+    local pids=()
+    a=$(date +%s%N)
+    for j in $(seq 0 $((JOBS - 1))); do
+      taskset -c "${CPUS[$j]}" /usr/bin/time -f "%M" -o "$T/t$j" \
+        "$@" < "$IN" > /dev/null 2>&1 &
+      pids+=("$!")
+    done
+    for pid in "${pids[@]}"; do wait "$pid" || return 1; done
+    b=$(date +%s%N)
+    cp "$T/t0" "$T/t"
+    echo "$(( (b - a) / 1000 )) $(cat "$T/t")"
+  done | sort -n | awk '
+    {t[NR]=$1; m[NR]=$2}
+    END {k=int((NR+1)/2); printf "%.1f %.1f", t[k]/1000, m[k]/1024}'
+}
+
+# row <eval> <input> <goose cmd> -- <ris cmd>
+row() {
+  local ev=$1 name=$2; IN=$3; shift 3
+  local g=() r=()
+  while [ "$1" != -- ]; do g+=("$1"); shift; done; shift; r=("$@")
+  if ! "${g[@]}" < "$IN" > "$T/goose" 2> "$T/goose.err"; then
+    cat "$T/goose.err" >&2
+    return 1
+  fi
+  if ! "${r[@]}" < "$IN" > "$T/ris" 2> "$T/ris.err"; then
+    cat "$T/ris.err" >&2
+    return 1
+  fi
+  if ! cmp -s "$T/goose" "$T/ris"; then
+    echo "output differs: $ev $name" >&2
+    diff -u "$T/goose" "$T/ris" >&2 || true
+    return 1
+  fi
+  local measured
+  measured=$(median "${g[@]}") || return 1
+  read -r gt gm <<< "$measured"
+  measured=$(median "${r[@]}") || return 1
+  read -r rt rm <<< "$measured"
+  awk -v e="$ev" -v n="$name" -v gt="$gt" -v gm="$gm" \
+    -v rt="$rt" -v rm="$rm" 'BEGIN {
+    printf "| %s | %s | %.1f ms | %.1f ms | %.2fx | %.1f MB | %.1f MB |\n",
+      e, n, gt, rt, rt/gt, gm, rm }'
+}
+
+echo "$JOBS copies at once, median of $N batches"; echo
+echo "| eval | input | Goose | ris | ris/Goose | Goose RSS | ris RSS |"
+echo "|---|---|---:|---:|---:|---:|---:|"
+for d in "$INPUTS"/ninja/*"$SIZE"; do
+  [ -f "$d/build.ninja" ] || continue
+  (cd "$d" && row ninja "$(basename "$d")" /dev/null \
+    "$OUT/ninja/bin/goose_load" build.ninja -- \
+    "$OUT/ninja/bin/ris_load" build.ninja)
+done
+for f in "$INPUTS"/json/*.json; do
+  row json "$(basename "$f")" /dev/null \
+    "$OUT/json/bin/bench_goose" "$f" -- "$OUT/json/bin/bench_ris" "$f"
+done
+for f in "$INPUTS"/yaml/real/"$SIZE".yaml "$INPUTS"/yaml/gen/"$SIZE".yaml; do
+  [ -f "$f" ] || continue
+  row yaml "${f#"$INPUTS"/yaml/}" /dev/null \
+    "$OUT/yaml/bin/yaml_goose" "$f" -- "$OUT/yaml/bin/yaml_ris" "$f"
+done
+select_filter='select(.type == "PushEvent") | '
+select_filter+='{repo: .repo.name, actor: .actor.login, '
+select_filter+='n: (.payload.commits | length)}'
+for src in gh gen; do
+  for c in "reemit|." \
+    "select|$select_filter" \
+    "strings|[.. | strings | length] | add"; do
+    f=${c#*|}
+    row jq "$src-${c%%|*}-$s" "$INPUTS/jq/$src-$s.ndjson" \
+      "$OUT/jq/bin/jqg" "$f" -- "$OUT/jq/bin/jqg_ris" "$f"
+  done
+done

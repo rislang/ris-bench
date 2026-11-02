@@ -1,0 +1,748 @@
+# Goose YAML DOM: one byte pool, inline scalars and Int32 byte links; the
+# text is read with a String::Scanner.
+
+import std/int
+import std/file
+import std/io
+import std/time::{Time}
+
+# One sized read of the whole file onto the tape.
+def read_text(path : String) : String
+  File.read(path)
+end
+
+def write_text(path : String, text : String) : Nil
+  io = File.open(path, "w", owner: Program.tape)
+  defer io.close
+  io << text
+end
+
+MAPVAL  = 0
+SEQITEM = 1
+DOC     = 2
+
+# True when no byte of w is below 32, a quote or a backslash.
+def plain8(w : UInt64) : Bool
+  ones = 0x0101010101010101_u64
+  q = w ^ (ones &* 34)
+  b = w ^ (ones &* 92)
+  bad = ((w &- ones &* 32) & ~w) | ((q &- ones) & ~q) | ((b &- ones) & ~b)
+  (bad & 0x8080808080808080_u64) == 0
+end
+
+@[OnTape]
+struct Document
+  @ls : Int32
+  @n : Int32
+
+  def initialize(text : String)
+    @sc = String::Scanner.new(text)
+    @n = text.bytesize
+    @ls = 0
+    @pool = Array(UInt8).new(@n)
+    @kids = Array(Int32).new
+    @roots = Array(Int32).new
+    @sbuf = String::Builder.new(256)
+    @output = String::Builder.new(@n)
+    @counts = Array(Int64).new(6) { 0_i64 }
+  end
+
+  def fail(message : String) : NoReturn
+    raise "parse error at #{@sc.offset}: #{message}"
+  end
+
+  def at(i : Int32) : UInt8
+    i < @n ? @sc.string[i] : 0_u8
+  end
+
+  # Moves past spaces, and tabs too when *tabs*, on a local cursor.
+  def skip_spaces(tabs : Bool) : Nil
+    text = @sc.string
+    p = @sc.offset
+    while p < text.bytesize && (text[p] == 32 || (tabs && text[p] == 9))
+      p += 1
+    end
+    @sc.advance(p - @sc.offset)
+  end
+
+  def col : Int32
+    @sc.offset - @ls
+  end
+
+  def is_brk(c : UInt8) : Bool
+    c == 10 || c == 13
+  end
+
+  def is_end(c : UInt8) : Bool
+    c == 32 || c == 10 || c == 13 || c == 0 || c == 9
+  end
+
+  def is_flow_ind(c : UInt8) : Bool
+    c == 44 || c == 91 || c == 93 || c == 123 || c == 125
+  end
+
+  def eat_brk : Nil
+    @sc.advance(at(@sc.offset) == 13 && at(@sc.offset + 1) == 10 ? 2 : 1)
+    @ls = @sc.offset
+  end
+
+  def is_doc_marker : Bool
+    return false unless col == 0 && @sc.offset + 3 <= @n
+    c = @sc.string[@sc.offset]
+    return false unless (c == 45 || c == 46) &&
+                        @sc.string[@sc.offset + 1] == c && \
+                           @sc.string[@sc.offset + 2] == c
+    is_end(at(@sc.offset + 3))
+  end
+
+  def skip_blank : Nil
+    loop do
+      skip_spaces(true)
+      c = at(@sc.offset)
+      if c == 35
+        while @sc.offset < @n && !is_brk(@sc.string[@sc.offset])
+          @sc.advance
+        end
+        next
+      end
+      if is_brk(c)
+        eat_brk
+        next
+      end
+      return
+    end
+  end
+
+  # Nodes are complete when appended: tag, varint length, then bytes or links.
+  def push_length(n : Int32) : Nil
+    v = n
+    loop do
+      @pool << ((v & 127) | (v >= 128 ? 128 : 0)).to_u8
+      v >>= 7
+      break if v == 0
+    end
+  end
+
+  def span(at : Int32) : {Int32, Int32}
+    n = 0
+    shift = 0
+    loop do
+      c = @pool[at]
+      at += 1
+      n |= (c & 127).to_i32 << shift
+      break if c < 128
+      shift += 7
+    end
+    {at, n}
+  end
+
+  def null_node : Int32
+    node = @pool.size
+    @pool << 0_u8
+    node
+  end
+
+  def string_node(s : String) : Int32
+    node = @pool.size
+    @pool << 1_u8
+    push_length(s.bytesize)
+    @pool.append(s)
+    node
+  end
+
+  def str_node(a : Int32, b : Int32) : Int32
+    string_node(@sc.string[a, b - a])
+  end
+
+  def sbuf_node : Int32
+    string_node(@sbuf.finish)
+  end
+
+  def is_null_word(a : Int32, b : Int32) : Bool
+    n = b - a
+    return true if n == 0
+    return @sc.string[a] == 126 if n == 1
+    return false unless n == 4
+    s = @sc.string[a, n]
+    s == "null" || s == "Null" || s == "NULL"
+  end
+
+  def collection(mark : Int32, tag : UInt8) : Int32
+    node = @pool.size
+    @pool << tag
+    push_length(@kids.size - mark)
+    i = mark
+    while i < @kids.size
+      @pool.write_bytes(@kids[i].to_u32)
+      i += 1
+    end
+    while @kids.size > mark
+      @kids.pop
+    end
+    node
+  end
+
+  def seq_node(mark : Int32) : Int32
+    collection(mark, 2_u8)
+  end
+
+  def map_node(mark : Int32) : Int32
+    collection(mark, 3_u8)
+  end
+
+  # A plain scalar gap: -1 ends, 0 preserves spaces, 1 folds, 2+k adds k breaks.
+  def plain_gap(indent : Int32, flow : Bool) : {Int32, Int32, Int32}
+    ws = @sc.offset
+    skip_spaces(true)
+    we = @sc.offset
+    unless is_brk(at(@sc.offset))
+      return {0, ws, we} if we > ws
+      return {-1, 0, 0}
+    end
+    eat_brk
+    return {-1, 0, 0} if is_doc_marker
+    breaks = 0
+    loop do
+      skip_spaces(false)
+      break unless is_brk(at(@sc.offset))
+      eat_brk
+      breaks += 1
+      return {-1, 0, 0} if is_doc_marker
+    end
+    return {-1, 0, 0} if at(@sc.offset) == 35 || (!flow && col < indent)
+    return {1, 0, 0} if breaks == 0
+    {2 + breaks, 0, 0}
+  end
+
+  # Moves past one plain word on a local cursor: one scanner move, and
+  # one bounds check a byte rather than `at`'s two.
+  def word_run(flow : Bool) : Nil
+    text = @sc.string
+    p = @sc.offset
+    while p < text.bytesize
+      c = text[p]
+      break if is_end(c)
+      if c == 58
+        d = p + 1 < @n ? text[p + 1] : 0_u8
+        break if is_end(d) || (flow && is_flow_ind(d))
+      end
+      break if flow && is_flow_ind(c)
+      p += 1
+    end
+    @sc.advance(p - @sc.offset)
+  end
+
+  def scan_plain(indent : Int32, flow : Bool) : Int32
+    start = @sc.offset
+    stop = @sc.offset
+    words = 0
+    gk = 0
+    ga = 0
+    gb = 0
+    loop do
+      break if at(@sc.offset) == 35
+      w0 = @sc.offset
+      word_run(flow)
+      break if @sc.offset == w0
+      if words == 1
+        @sbuf.clear
+        @sbuf.append(@sc.string[start, stop - start])
+      end
+      if words >= 1
+        if gk == 0
+          @sbuf.append(@sc.string[ga, gb - ga])
+        elsif gk == 1
+          @sbuf.push(32_u8)
+        else
+          (gk - 2).times { @sbuf.push(10_u8) }
+        end
+        @sbuf.append(@sc.string[w0, @sc.offset - w0])
+      end
+      stop = @sc.offset
+      words += 1
+      k, a, b = plain_gap(indent, flow)
+      break if k < 0
+      gk = k
+      ga = a
+      gb = b
+    end
+    if words <= 1
+      return null_node if is_null_word(start, stop)
+      return str_node(start, stop)
+    end
+    sbuf_node
+  end
+
+  def hexval(c : UInt8) : Int64
+    return c.to_i64 - 48 if c >= 48 && c <= 57
+    return c.to_i64 - 87 if c >= 97 && c <= 102
+    return c.to_i64 - 55 if c >= 65 && c <= 70
+    fail("bad hex digit in escape")
+  end
+
+  def put_utf8(cp : Int64) : Nil
+    if cp < 0x80
+      @sbuf.push(cp.to_u8)
+    elsif cp < 0x800
+      @sbuf.push((0xC0 | (cp >> 6)).to_u8)
+      @sbuf.push((0x80 | (cp & 63)).to_u8)
+    elsif cp < 0x10000
+      @sbuf.push((0xE0 | (cp >> 12)).to_u8)
+      @sbuf.push((0x80 | ((cp >> 6) & 63)).to_u8)
+      @sbuf.push((0x80 | (cp & 63)).to_u8)
+    else
+      @sbuf.push((0xF0 | (cp >> 18)).to_u8)
+      @sbuf.push((0x80 | ((cp >> 12) & 63)).to_u8)
+      @sbuf.push((0x80 | ((cp >> 6) & 63)).to_u8)
+      @sbuf.push((0x80 | (cp & 63)).to_u8)
+    end
+  end
+
+  def quoted_breaks : Nil
+    loop do
+      skip_spaces(true)
+      return unless is_brk(at(@sc.offset))
+      eat_brk
+      @sbuf.push(10_u8)
+    end
+  end
+
+  def scan_quoted : Int32
+    q = @sc.string[@sc.offset]
+    dq = q == 34
+    @sc.advance
+    s0 = @sc.offset
+    while @sc.offset < @n && @sc.string[@sc.offset] != q && \
+             @sc.string[@sc.offset] != 92 && !is_brk(@sc.string[@sc.offset])
+      @sc.advance
+    end
+    if at(@sc.offset) == q && (dq || at(@sc.offset + 1) != 39)
+      @sc.advance
+      return str_node(s0, @sc.offset - 1)
+    end
+    @sbuf.clear
+    @sbuf.append(@sc.string[s0, @sc.offset - s0])
+    loop do
+      fail("unterminated quoted scalar") unless @sc.offset < @n
+      c = @sc.string[@sc.offset]
+      if c == q
+        if !dq && at(@sc.offset + 1) == 39
+          @sbuf.push(39_u8)
+          @sc.advance(2)
+          next
+        end
+        @sc.advance
+        break
+      end
+      if dq && c == 92
+        e = at(@sc.offset + 1)
+        @sc.advance(2)
+        if is_brk(e)
+          @sc.advance(-1)
+          eat_brk
+          quoted_breaks
+          next
+        end
+        case e
+        when 48             then @sbuf.push(0_u8)
+        when 97             then @sbuf.push(7_u8)
+        when 98             then @sbuf.push(8_u8)
+        when 116, 9         then @sbuf.push(9_u8)
+        when 110            then @sbuf.push(10_u8)
+        when 118            then @sbuf.push(11_u8)
+        when 102            then @sbuf.push(12_u8)
+        when 114            then @sbuf.push(13_u8)
+        when 101            then @sbuf.push(27_u8)
+        when 32, 34, 92, 47 then @sbuf.push(e)
+        when 78             then put_utf8(0x85_i64)
+        when 95             then put_utf8(0xA0_i64)
+        when 76             then put_utf8(0x2028_i64)
+        when 80             then put_utf8(0x2029_i64)
+        when 120, 117, 85
+          k = e == 120 ? 2 : (e == 117 ? 4 : 8)
+          cp = 0_i64
+          k.times { |i| cp = cp * 16 + hexval(at(@sc.offset + i)) }
+          @sc.advance(k)
+          put_utf8(cp)
+        else
+          fail("unknown escape in double-quoted scalar")
+        end
+        next
+      end
+      if c == 32 || c == 9 || is_brk(c)
+        ws = @sc.offset
+        skip_spaces(true)
+        if is_brk(at(@sc.offset))
+          eat_brk
+          before = @sbuf.finish.bytesize
+          quoted_breaks
+          @sbuf.push(32_u8) if @sbuf.finish.bytesize == before
+        else
+          @sbuf.append(@sc.string[ws, @sc.offset - ws])
+        end
+        next
+      end
+      @sbuf.push(c)
+      @sc.advance
+    end
+    sbuf_node
+  end
+
+  def block_breaks(indent : Int32) : Int32
+    k = 0
+    while col < indent && at(@sc.offset) == 32
+      @sc.advance
+    end
+    while is_brk(at(@sc.offset))
+      eat_brk
+      k += 1
+      while col < indent && at(@sc.offset) == 32
+        @sc.advance
+      end
+    end
+    k
+  end
+
+  def scan_block(pind : Int32) : Int32
+    folded = @sc.string[@sc.offset] == 62
+    @sc.advance
+    chomp = 0
+    inc = 0
+    loop do
+      c = at(@sc.offset)
+      if c == 45
+        chomp = -1
+        @sc.advance
+      elsif c == 43
+        chomp = 1
+        @sc.advance
+      elsif c >= 49 && c <= 57
+        inc = c.to_i32 - 48
+        @sc.advance
+      else
+        break
+      end
+    end
+    skip_spaces(true)
+    if at(@sc.offset) == 35
+      while @sc.offset < @n && !is_brk(@sc.string[@sc.offset])
+        @sc.advance
+      end
+    end
+    eat_brk if is_brk(at(@sc.offset))
+    min_indent = pind + 1
+    min_indent = 1 if min_indent < 1
+    indent = 0
+    breaks = 0
+    if inc == 0
+      max_indent = 0
+      loop do
+        c = at(@sc.offset)
+        if c == 32
+          @sc.advance
+          max_indent = col if col > max_indent
+        elsif is_brk(c)
+          eat_brk
+          breaks += 1
+        else
+          break
+        end
+      end
+      indent = max_indent > min_indent ? max_indent : min_indent
+    else
+      indent = min_indent + inc - 1
+      breaks = block_breaks(indent)
+    end
+    @sbuf.clear
+    brk = false
+    while col == indent && @sc.offset < @n
+      breaks.times { @sbuf.push(10_u8) }
+      lead_ns = at(@sc.offset) != 32 && at(@sc.offset) != 9
+      a = @sc.offset
+      while @sc.offset < @n && !is_brk(@sc.string[@sc.offset])
+        @sc.advance
+      end
+      @sbuf.append(@sc.string[a, @sc.offset - a])
+      brk = is_brk(at(@sc.offset))
+      eat_brk if brk
+      breaks = block_breaks(indent)
+      if col == indent && @sc.offset < @n
+        if folded && brk && lead_ns && at(@sc.offset) != 32 && \
+              at(@sc.offset) != 9
+          @sbuf.push(32_u8) if breaks == 0
+        elsif brk
+          @sbuf.push(10_u8)
+        end
+      else
+        break
+      end
+    end
+    @sbuf.push(10_u8) if chomp >= 0 && brk
+    breaks.times { @sbuf.push(10_u8) } if chomp == 1
+    sbuf_node
+  end
+
+  def unsupported(c : UInt8) : Bool
+    c == 38 || c == 42 || c == 33 || c == 37 || c == 64 || c == 96
+  end
+
+  def parse_here(pind : Int32) : Int32
+    c = @sc.string[@sc.offset]
+    return parse_seq(col) if c == 45 && is_end(at(@sc.offset + 1))
+    return scan_block(pind) if c == 124 || c == 62
+    return parse_flow if c == 91 || c == 123
+    fail("unsupported YAML construct") if (c == 63 && is_end(at(@sc.offset + \
+                                            1))) || unsupported(c)
+    kcol = col
+    if c == 34 || c == 39
+      k = scan_quoted
+      skip_spaces(true)
+      return parse_map(kcol, k) if at(@sc.offset) == 58 && \
+                                      is_end(at(@sc.offset + 1))
+      return k
+    end
+    k = scan_plain(pind + 1, false)
+    return parse_map(kcol, k) if at(@sc.offset) == 58 && \
+                                    is_end(at(@sc.offset + 1))
+    k
+  end
+
+  def parse_value(pind : Int32, ctx : Int32) : Int32
+    skip_spaces(true)
+    c = at(@sc.offset)
+    if @sc.offset >= @n || is_brk(c) || c == 35
+      skip_blank
+      return null_node if @sc.offset >= @n || is_doc_marker
+      ind = col
+      return parse_here(pind) if ind > pind
+      if ctx == MAPVAL && ind == pind && @sc.string[@sc.offset] == 45 && \
+            is_end(at(@sc.offset + 1))
+        return parse_seq(ind)
+      end
+      return null_node
+    end
+    parse_here(pind)
+  end
+
+  def parse_seq(ind : Int32) : Int32
+    mark = @kids.size
+    loop do
+      @sc.advance
+      @kids << parse_value(ind, SEQITEM)
+      skip_blank
+      break unless @sc.offset < @n && col == ind && @sc.string[@sc.offset] \
+                     == 45 &&
+                     is_end(at(@sc.offset + 1)) && !is_doc_marker
+    end
+    seq_node(mark)
+  end
+
+  def parse_map(ind : Int32, first : Int32) : Int32
+    mark = @kids.size
+    @kids << first
+    loop do
+      @sc.advance
+      @kids << parse_value(ind, MAPVAL)
+      skip_blank
+      break unless @sc.offset < @n && col == ind && !is_doc_marker
+      c = @sc.string[@sc.offset]
+      if (c == 63 && is_end(at(@sc.offset + 1))) || unsupported(c) || c == \
+           91 || c == 123
+        fail("unsupported YAML construct")
+      end
+      if c == 45 && is_end(at(@sc.offset + 1))
+        fail("sequence entry where a key was expected")
+      end
+      @kids << (c == 34 || c == 39 ? scan_quoted : scan_plain(ind + 1, false))
+      skip_spaces(true)
+      fail("expected ':' after a mapping key") unless at(@sc.offset) == 58
+    end
+    map_node(mark)
+  end
+
+  def parse_flow : Int32
+    skip_blank
+    c = at(@sc.offset)
+    if c == 91
+      @sc.advance
+      mark = @kids.size
+      loop do
+        skip_blank
+        if at(@sc.offset) == 93
+          @sc.advance
+          break
+        end
+        @kids << parse_flow
+        skip_blank
+        fail("single-pair mapping in a flow sequence") if at(@sc.offset) == 58
+        if at(@sc.offset) == 44
+          @sc.advance
+        elsif at(@sc.offset) != 93
+          fail("expected ',' or ']'")
+        end
+      end
+      return seq_node(mark)
+    end
+    if c == 123
+      @sc.advance
+      mark = @kids.size
+      loop do
+        skip_blank
+        if at(@sc.offset) == 125
+          @sc.advance
+          break
+        end
+        @kids << parse_flow
+        skip_blank
+        if at(@sc.offset) == 58
+          @sc.advance
+          skip_blank
+          @kids << (at(@sc.offset) == 44 || at(@sc.offset) == 125 ? null_node : parse_flow)
+        else
+          @kids << null_node
+        end
+        skip_blank
+        if at(@sc.offset) == 44
+          @sc.advance
+        elsif at(@sc.offset) != 125
+          fail("expected ',' or '}'")
+        end
+      end
+      return map_node(mark)
+    end
+    return scan_quoted if c == 34 || c == 39
+    fail("unsupported YAML construct") if unsupported(c)
+    scan_plain(0, true)
+  end
+
+  def parse_all : Nil
+    loop do
+      skip_blank
+      break unless @sc.offset < @n
+      if is_doc_marker
+        dash = @sc.string[@sc.offset] == 45
+        @sc.advance(3)
+        @roots << parse_value(-1, DOC) if dash
+        next
+      end
+      fail("directives are not supported") if @sc.string[@sc.offset] == 37
+      @roots << parse_here(-1)
+    end
+  end
+
+  # Clean runs go out whole, eight bytes a step where the pool has them.
+  def emit_str(node : Int32) : Nil
+    s, n = span(node + 1)
+    @counts[5] += n
+    text = @pool.bytes
+    @output.push(34_u8)
+    run = 0
+    i = 0
+    while i < n
+      if i + 8 <= n && plain8(@pool.read_bytes_at(UInt64, s + i))
+        i += 8
+        next
+      end
+      c = @pool[s + i]
+      if c < 32 || c == 34 || c == 92
+        @output.append(text[s + run, i - run])
+        run = i + 1
+        if c == 34
+          @output.append("\\\"")
+        elsif c == 92
+          @output.append("\\\\")
+        else
+          @output.append("\\u00")
+          @output.push("0123456789abcdef".as_tape[(c >> 4).to_i32])
+          @output.push("0123456789abcdef".as_tape[(c & 15).to_i32])
+        end
+      end
+      i += 1
+    end
+    @output.append(text[s + run, n - run])
+    @output.push(34_u8)
+  end
+
+  def follow(at : Int32) : Int32
+    @pool.read_bytes_at(UInt32, at).to_i32
+  end
+
+  def walk(node : Int32) : Nil
+    kind = @pool[node]
+    if kind == 0
+      @counts[2] += 1
+      @counts[3] += 1
+      @output.append("null")
+    elsif kind == 1
+      @counts[2] += 1
+      emit_str(node)
+    else
+      map = kind == 3
+      @counts[map ? 0 : 1] += 1
+      @output.push(map ? 123_u8 : 91_u8)
+      s, n = span(node + 1)
+      n.times do |i|
+        child = follow(s + i * 4)
+        if map && i % 2 == 0
+          @output.push(44_u8) if i > 0
+          @counts[4] += 1
+          if @pool[child] == 1
+            emit_str(child)
+          else
+            @output.append("null")
+          end
+          @output.push(58_u8)
+        else
+          @output.push(44_u8) if !map && i > 0
+          walk(child)
+        end
+      end
+      @output.push(map ? 125_u8 : 93_u8)
+    end
+  end
+
+  def run(output_path : String?, read_seconds : Float64) : Nil
+    t1 = Time.monotonic
+    parse_all
+    t2 = Time.monotonic
+    @roots.each do |root|
+      walk(root)
+      @output.push(10_u8)
+    end
+    t3 = Time.monotonic
+    output = @output.finish
+    if path = output_path
+      write_text(path, output)
+    end
+    h = 14695981039346656037_u64
+    output.each_byte { |b| h = (h ^ b.to_u64) &* 1099511628211_u64 }
+    t5 = Time.monotonic
+    STDERR.puts "phases_ms read #{(read_seconds * 1000).round(1)} " \
+                "parse #{((t2 - t1).total_seconds * 1000).round(1)} " \
+                "walk_emit #{((t3 - t2).total_seconds * 1000).round(1)} " \
+                "teardown 0.0 " \
+                "hash #{((t5 - t3).total_seconds * 1000).round(1)}"
+    puts @roots.size
+    puts @counts[0] + @counts[1] + @counts[2]
+    6.times { |i| puts @counts[i] }
+    puts output.bytesize
+    puts h
+  end
+end
+
+if Program.arguments.empty?
+  STDERR.puts "usage: yaml <in.yaml> [<out.json>]"
+  exit 1
+end
+path = Program.arguments[0]
+unless File.exists?(path)
+  STDERR.puts "cannot read input"
+  exit 1
+end
+t0 = Time.monotonic
+text = read_text(path)
+read_seconds = (Time.monotonic - t0).total_seconds
+tape do
+  doc = Document.new(text)
+  doc.run(Program.arguments.size > 1 ? Program.arguments[1] : nil, read_seconds)
+end

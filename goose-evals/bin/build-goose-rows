@@ -1,0 +1,29 @@
+#!/bin/bash
+# Build only what bin/bench-ris compares against: a Python venv (PyYAML,
+# cmake, ninja), goose at the pinned commit and the four Goose rows,
+# with the same commands as each evaluation's scripts/build.sh. Unlike
+# bin/build-all it needs no cargo and builds no baselines.
+set -euo pipefail
+source "$(dirname "$0")/env.sh"
+mkdir -p "$DEPS" "$OUT/logs"
+if [ ! -x "$PY" ]; then
+  python3 -m venv "$DEPS/venv"
+  "$DEPS/venv/bin/pip" install -q --upgrade pip
+  "$DEPS/venv/bin/pip" install -q pyyaml==6.0.3 cmake ninja
+fi
+fetch_repo goose aardappel/goose "$GOOSE_COMMIT"
+if [ ! -x "$GOOSE" ]; then
+  log "goose: building $GOOSE_COMMIT"
+  (cd "$DEPS/goose" && cmake -B build -DCMAKE_BUILD_TYPE=Release &&
+    cmake --build build -j"$(nproc)") > "$OUT/logs/build-goose.log" 2>&1
+fi
+for e in ninja json yaml jq; do mkdir -p "$OUT/$e/bin"; done
+"$GOOSE" build "$ROOT/ninja/goose/ninja_load.goose" -O2 --cc gcc \
+  -o "$OUT/ninja/bin/goose_load"
+gcc -O2 -o "$OUT/json/bin/gen_events" "$ROOT/json/inputs/gen_events.c"
+(cd "$ROOT/json/goose" &&
+  "$GOOSE" build json.goose -O2 --cc gcc -o "$OUT/json/bin/bench_goose")
+"$GOOSE" build "$ROOT/yaml/goose/yaml.goose" -O2 --cc gcc \
+  -o "$OUT/yaml/bin/yaml_goose"
+"$GOOSE" build "$ROOT/jq/goose/jqg.goose" -O2 --cc gcc -o "$OUT/jq/bin/jqg"
+log "goose rows built"

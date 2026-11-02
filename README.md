@@ -62,3 +62,19 @@ checked against Goose's.
 | graph_csr | 0.64 s, 109 MB | 1.06 s, 108 MB | 1.06 s, 174 MB |
 | words | 0.22 s, 68 MB | 0.34 s, 90 MB | 0.54 s, 175 MB |
 | bintrees | 0.06 s, 7.9 MB | 0.10 s, 7.1 MB | 0.32 s, 23.8 MB |
+
+## goose-evaluations: `goose-evals.sh`
+
+The ris ports of the four programs in
+[goose-evaluations](https://github.com/calpeyser/goose-evaluations)
+(jq, json, ninja, yaml; Apache 2.0), timed against their Goose rows on
+the same inputs. `goose-evals/` holds the ports, their build scripts and
+`bin/bench-ris` at upstream's paths; the script fetches upstream at a
+pinned commit into `build/goose-evals`, lays `goose-evals/` over it,
+builds goose and the four Goose rows (no cargo, no baselines), fetches
+the inputs and checks each port's output against Goose's.
+
+    RIS=~/ris/bin/ris ./goose-evals.sh            # small, median of 5
+    RIS=~/ris/bin/ris ./goose-evals.sh medium 5
+
+The table's ris/Goose is ris time / Goose time: lower is faster.
