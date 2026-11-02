@@ -126,6 +126,10 @@ class Loader
     @str_bytes = 0_i64
     @text_bytes = @sc.string.bytesize.to_i64
     @lim = @sc.string.bytesize
+  end
+
+  # Rule 0, phony: growth comes after new (SPEC 2.2).
+  def start : Nil
     @rules << Rule.new(0, 0)
     @rule_by_name["phony".as_tape] = 0
   end
@@ -760,4 +764,5 @@ unless File.exists?(path)
 end
 text = read_text(path).copy_to(Program.tape)
 loader = Loader.new(text)
+loader.start
 loader.run(Program.arguments.size > 1 ? Program.arguments[1].as_tape : "")
