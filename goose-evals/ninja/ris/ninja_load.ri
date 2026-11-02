@@ -3,11 +3,6 @@
 import std/int
 import std/file
 
-# One sized read of the whole file onto the tape.
-def read_text(path : String) : String
-  File.read(path)
-end
-
 @[OnTape]
 struct Node
   property path : String
@@ -590,7 +585,7 @@ class Loader
     sp = scan(true)
     expect_newline
     path = eval_value(sp, 0, 0, 0)
-    included = read_text(path).copy_to(Program.tape)
+    included = File.copy_to(Program.tape, path)
     @text_bytes += included.bytesize
     saved = @sc
     @sc = String::Scanner.new(included)
@@ -762,7 +757,7 @@ unless File.exists?(path)
   puts "cannot read #{path}"
   exit 1
 end
-text = read_text(path).copy_to(Program.tape)
+text = File.copy_to(Program.tape, path)
 loader = Loader.new(text)
 loader.start
 loader.run(Program.arguments.size > 1 ? Program.arguments[1].as_tape : "")
