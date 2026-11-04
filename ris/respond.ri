@@ -5,7 +5,7 @@
 # For each of 1.6 million requests, build the typed response - an id, a user
 # name, 1..8 line items each with a sku - render it as JSON, hash it and throw
 # both away. The response is two `@[OnTape]` structs whose strings and list
-# are `Tape::String` and `Tape::Array`, so each request's objects are bumped
+# are `String` and `Array`, so each request's objects are bumped
 # onto the fiber's tape and freed together when its `tape` ends. Prints
 # the request count, the bytes rendered and a checksum: 1600000, 367459487,
 # 7480137599999527189, the same as the other languages' versions in
@@ -32,31 +32,31 @@ end
 
 @[OnTape]
 struct Item
-  getter sku : Tape::String
+  getter sku : String
   getter qty : Int64
   getter price : Int64
 
-  def initialize(@sku : Tape::String, @qty : Int64, @price : Int64)
+  def initialize(@sku : String, @qty : Int64, @price : Int64)
   end
 end
 
 @[OnTape]
 struct Resp
   getter id : Int64
-  getter user : Tape::String
-  getter items : Tape::Array(Item)
+  getter user : String
+  getter items : Array(Item)
 
-  def initialize(@id : Int64, @user : Tape::String, @items : Tape::Array(Item))
+  def initialize(@id : Int64, @user : String, @items : Array(Item))
   end
 end
 
 # A user name of 3..10 letters; one in eight carries a quote or a backslash
 # so the escaping path in the renderer is real.
-def name_of(seed : UInt64) : Tape::String
+def name_of(seed : UInt64) : String
   r = xs_next(seed)
   n = 3_i64 + xs_mod(r, 8_i64)
   odd = xs_mod(r >> 8, 8_i64) == 0_i64
-  Tape::String.build(16) do |s|
+  String.build(16) do |s|
     i = 0_i64
     while i < n
       r = xs_next(r)
@@ -70,30 +70,32 @@ def name_of(seed : UInt64) : Tape::String
   end
 end
 
-# A stock keeping unit: two letters and four digits.
-def sku_of(seed : UInt64) : Tape::String
+# A stock keeping unit: two letters and four digits, written onto the
+# end of *into*: a view of it.
+def sku_of(seed : UInt64, into : String::Builder) : String
+  from = into.bytesize
   r = xs_next(seed)
-  Tape::String.build(8) do |s|
-    s.push((65_i64 + xs_mod(r, 26_i64)).to_u8)
-    s.push((65_i64 + xs_mod(r >> 8, 26_i64)).to_u8)
-    i = 0
-    while i < 4
-      r = xs_next(r)
-      s.push((48_i64 + xs_mod(r, 10_i64)).to_u8)
-      i += 1
-    end
-  end
-end
-
-def make_items(seed : UInt64, n : Int64) : Tape::Array(Item)
-  r = seed
-  Tape::Array(Item).new(n.to_i32) do
+  into.push((65_i64 + xs_mod(r, 26_i64)).to_u8)
+  into.push((65_i64 + xs_mod(r >> 8, 26_i64)).to_u8)
+  i = 0
+  while i < 4
     r = xs_next(r)
-    Item.new(sku_of(r), 1_i64 + xs_mod(r >> 8, 5_i64), 100_i64 + xs_mod(r >> 16, 99900_i64))
+    into.push((48_i64 + xs_mod(r, 10_i64)).to_u8)
+    i += 1
+  end
+  into.finish[from, 6]
+end
+
+# One call, so the items are made in the caller's scope; each one's SKU
+# goes into the caller's *skus*, which it views.
+def make_items(seed : UInt64, n : Int64, skus : String::Builder) : Array(Item)
+  Array(Item).new(n.to_i32) do
+    seed = xs_next(seed)
+    Item.new(sku_of(seed, skus), 1_i64 + xs_mod(seed >> 8, 5_i64), 100_i64 + xs_mod(seed >> 16, 99900_i64))
   end
 end
 
-def emit_str(buf : Tape::String::Writer, s : Tape::String) : Nil
+def emit_str(buf : String::Builder, s : String) : Nil
   buf.push(34_u8)
   s.each_byte do |c|
     buf.push(92_u8) if c == 34_u8 || c == 92_u8
@@ -102,8 +104,8 @@ def emit_str(buf : Tape::String::Writer, s : Tape::String) : Nil
   buf.push(34_u8)
 end
 
-def render(r : Resp) : Tape::String
-  Tape::String.build(256) do |buf|
+def render(r : Resp) : String
+  String.build(256) do |buf|
     buf.append("{\"id\":")
     buf.append_int(r.id)
     buf.append(",\"user\":")
@@ -129,7 +131,7 @@ def render(r : Resp) : Tape::String
   end
 end
 
-def fnv(s : Tape::String) : UInt64
+def fnv(s : String) : UInt64
   h = 14695981039346656037_u64
   s.each_byte { |c| h = (h ^ c.to_u64) &* 1099511628211_u64 }
   h
@@ -144,7 +146,8 @@ while i < N
   tape do
     r = xs_next(seed)
     n = 1_i64 + xs_mod(r, 8_i64)
-    resp = Resp.new(xs_mod(r >> 4, 1000000_i64), name_of(r >> 8), make_items(r >> 16, n))
+    skus = String::Builder.new(64)
+    resp = Resp.new(xs_mod(r >> 4, 1000000_i64), name_of(r >> 8), make_items(r >> 16, n, skus))
     out_text = render(resp)
     h = h ^ (fnv(out_text) &* 31_u64 &+ i.to_u64)
     bytes += out_text.bytesize.to_i64
